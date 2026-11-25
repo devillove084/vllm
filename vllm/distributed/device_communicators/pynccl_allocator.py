@@ -47,7 +47,11 @@ _cached_pool_snapshot = None
 
 def is_symmetric_memory_enabled():
     global _nccl_allocator_failed_to_compile
-    return envs.VLLM_USE_NCCL_SYMM_MEM and not _nccl_allocator_failed_to_compile
+    return (
+        not envs.VLLM_USE_PLAIT
+        and envs.VLLM_USE_NCCL_SYMM_MEM
+        and not _nccl_allocator_failed_to_compile
+    )
 
 
 def is_symmetric_memory_tensor(tensor: torch.Tensor):
