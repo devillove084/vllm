@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from typing import TYPE_CHECKING
 
 import torch
 from torch.distributed import ProcessGroup
@@ -24,6 +25,10 @@ from vllm.platforms import current_platform
 from ..utils import StatelessProcessGroup
 from .aiter_custom_all_reduce import AiterCustomAllreduce
 from .base_device_communicator import DeviceCommunicatorBase
+
+if TYPE_CHECKING:
+    from .flashinfer_all_reduce import FlashInferAllReduce
+    from .flashinfer_pcie_ipc_all_reduce import FlashInferPcieIpcAllReduce
 
 logger = init_logger(__name__)
 
@@ -53,9 +58,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
             global_world_size,
             use_all2all=use_all2all,
         )
-        # Match the group name exactly so ETP does not enable TP-only backends.
-        if unique_name.split(":")[0] != "tp":
-            # custom allreduce or torch symm mem can be used only by tp
+        # Plait owns tensor collectives when selected. The other fast paths are
+        # TP-only and must also stay disabled for ETP.
+        if envs.VLLM_USE_PLAIT or unique_name.split(":")[0] != "tp":
             use_custom_allreduce = False
             use_torch_symm_mem = False
             use_flashinfer_allreduce = False
@@ -90,12 +95,6 @@ class CudaCommunicator(DeviceCommunicatorBase):
         # lazy import to avoid documentation build error
         from vllm.distributed.device_communicators.custom_all_reduce import (
             CustomAllreduce,
-        )
-        from vllm.distributed.device_communicators.flashinfer_all_reduce import (
-            FlashInferAllReduce,
-        )
-        from vllm.distributed.device_communicators.flashinfer_pcie_ipc_all_reduce import (  # noqa: E501
-            FlashInferPcieIpcAllReduce,
         )
         from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
         from vllm.distributed.device_communicators.quick_all_reduce import (
@@ -132,7 +131,11 @@ class CudaCommunicator(DeviceCommunicatorBase):
             )
 
         if self.use_flashinfer_allreduce and self.world_size > 1:
-            self.fi_ar_comm = FlashInferAllReduce(
+            from vllm.distributed.device_communicators.flashinfer_all_reduce import (
+                FlashInferAllReduce as FlashInferBackend,
+            )
+
+            self.fi_ar_comm = FlashInferBackend(
                 group=self.cpu_group,
                 device=self.device,
             )
@@ -142,7 +145,11 @@ class CudaCommunicator(DeviceCommunicatorBase):
             and self.world_size > 1
             and self.device_group is not None
         ):
-            self.fi_pcie_ipc_ar_comm = FlashInferPcieIpcAllReduce(
+            from vllm.distributed.device_communicators.flashinfer_pcie_ipc_all_reduce import (  # noqa: E501
+                FlashInferPcieIpcAllReduce as FlashInferPcieBackend,
+            )
+
+            self.fi_pcie_ipc_ar_comm = FlashInferPcieBackend(
                 group=self.device_group,
                 tune_group=self.cpu_group,
                 device=self.device,
