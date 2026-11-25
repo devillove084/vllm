@@ -1790,6 +1790,25 @@ def init_distributed_environment(
 
     config = get_current_vllm_config_or_none()
     enable_elastic_ep = config is not None and config.parallel_config.enable_elastic_ep
+    if envs.VLLM_USE_PLAIT:
+        if (
+            envs.VLLM_DISABLE_PYNCCL
+            or envs.VLLM_DISTRIBUTED_USE_SPLIT_GROUP
+            or enable_elastic_ep
+        ):
+            raise ValueError("Plait requires PyNccl and standard process groups")
+        if (
+            config is not None
+            and config.model_config is not None
+            and not config.model_config.enforce_eager
+        ):
+            raise ValueError("Plait host-staged collectives require --enforce-eager")
+        backend = "gloo"
+        if (
+            torch.distributed.is_initialized()
+            and torch.distributed.get_backend() != backend
+        ):
+            raise ValueError("Initialize the Plait control process group with Gloo")
     if (
         config is not None
         and config.parallel_config.distributed_executor_backend != "external_launcher"
@@ -2041,6 +2060,19 @@ def initialize_model_parallel(
         backend = backend or torch.distributed.get_backend(
             get_world_group().device_group
         )
+
+    if envs.VLLM_USE_PLAIT:
+        # The compatibility rendezvous currently has one address per job.
+        if (
+            world_size != tensor_model_parallel_size
+            or pipeline_model_parallel_size != 1
+            or prefill_context_model_parallel_size != 1
+            or decode_context_model_parallel_size not in (None, 1)
+            or data_parallel_size != 1
+            or parallel_config.enable_expert_parallel
+        ):
+            raise ValueError("Plait currently requires one tensor-parallel group")
+        backend = "gloo"
 
     # the layout order is: ExternalDP x DP x PP x PCP x TP
     # ExternalDP is the data parallel group that is not part of the model,

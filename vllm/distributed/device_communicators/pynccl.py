@@ -34,6 +34,20 @@ def _warmup_deferred() -> bool:
     return getattr(_warmup_tls, "deferred", False)
 
 
+def _load_collective_library(
+    library_path: str | None, device: int | str | torch.device
+):
+    if not envs.VLLM_USE_PLAIT:
+        return NCCLLibrary(library_path)
+
+    from plait_nccl import NCCLLibrary as PlaitLibrary
+
+    index = device if isinstance(device, int) else torch.device(device).index
+    if index is None:
+        index = torch.cuda.current_device()
+    return PlaitLibrary(device=index)
+
+
 @contextlib.contextmanager
 def defer_comm_warmup_on_rocm():
     """Build communicators on this thread without their warm-up on ROCm, where
@@ -129,8 +143,10 @@ class PyNcclCommunicator:
             self.disabled = True
             return
         try:
-            self.nccl = NCCLLibrary(library_path)
+            self.nccl = _load_collective_library(library_path, device)
         except Exception:
+            if envs.VLLM_USE_PLAIT:
+                raise
             # disable because of missing NCCL library
             # e.g. in a non-GPU environment
             self.available = False
@@ -145,7 +161,10 @@ class PyNcclCommunicator:
         if self.rank == 0:
             # get the unique id from NCCL
             self.unique_id = self.nccl.ncclGetUniqueId()
-            logger.info_once("vLLM is using nccl==%s", self.nccl.ncclGetVersion())
+            if envs.VLLM_USE_PLAIT:
+                logger.info_once("vLLM tensor collectives are using Plait")
+            else:
+                logger.info_once("vLLM is using nccl==%s", self.nccl.ncclGetVersion())
         else:
             # construct an empty unique id
             self.unique_id = ncclUniqueId()
@@ -231,13 +250,13 @@ class PyNcclCommunicator:
             self.disabled = True
             return self
         try:
-            self.nccl = NCCLLibrary(library_path)
+            self.nccl = _load_collective_library(library_path, device)
         except Exception as e:
             # Unlike the TCPStore path, silently disabling here leaves the peer
             # blocked in ncclCommInitRank until timeout. The caller explicitly
             # asked to join from a unique id, so fail loudly instead.
             raise RuntimeError(
-                "failed to load the NCCL library for unique-id rendezvous"
+                "failed to load the collective library for unique-id rendezvous"
             ) from e
 
         self.available = True
