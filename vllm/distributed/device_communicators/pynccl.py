@@ -44,8 +44,17 @@ def _load_collective_library(
 
     index = device if isinstance(device, int) else torch.device(device).index
     if index is None:
-        index = torch.cuda.current_device()
+        index = torch.get_device_module(torch.device(device)).current_device()
     return PlaitLibrary(device=index)
+
+
+def _stream_pointer(stream) -> cudaStream_t:
+    if hasattr(stream, "npu_stream"):
+        # torch_npu can queue work on the host before it reaches the ACL stream.
+        # Flush that queue before Plait reads the device buffer.
+        stream.synchronize()
+        return cudaStream_t(stream.npu_stream)
+    return cudaStream_t(stream.cuda_stream)
 
 
 @contextlib.contextmanager
@@ -105,6 +114,11 @@ def register_nccl_symmetric_ops(pynccl_comm):
 class PyNcclCommunicator:
     # None for communicators built via `from_unique_id_bytes` (no process group).
     group: ProcessGroup | StatelessProcessGroup | None
+
+    def _current_stream(self):
+        if envs.VLLM_USE_PLAIT:
+            return torch.get_device_module(self.device).current_stream(self.device)
+        return current_stream()
 
     def __init__(
         self,
@@ -203,10 +217,10 @@ class PyNcclCommunicator:
             if _warmup_deferred():
                 return
 
-            stream = current_stream()
+            stream = self._current_stream()
             # A small all_reduce for warmup.
             data = torch.zeros(1, device=device)
-            self.all_reduce(data)
+            self.all_reduce(data, stream=stream)
             stream.synchronize()
             del data
 
@@ -305,7 +319,7 @@ class PyNcclCommunicator:
             out_tensor = torch.empty_like(in_tensor)
 
         if stream is None:
-            stream = current_stream()
+            stream = self._current_stream()
         self.nccl.ncclAllReduce(
             buffer_type(in_tensor.data_ptr()),
             buffer_type(out_tensor.data_ptr()),
@@ -313,7 +327,7 @@ class PyNcclCommunicator:
             ncclDataTypeEnum.from_torch(in_tensor.dtype),
             ncclRedOpTypeEnum.from_torch(op),
             self.comm,
-            cudaStream_t(stream.cuda_stream),
+            _stream_pointer(stream),
         )
         return out_tensor
 
@@ -330,14 +344,14 @@ class PyNcclCommunicator:
             f"but the input tensor is on {input_tensor.device}"
         )
         if stream is None:
-            stream = current_stream()
+            stream = self._current_stream()
         self.nccl.ncclAllGather(
             buffer_type(input_tensor.data_ptr()),
             buffer_type(output_tensor.data_ptr()),
             input_tensor.numel(),
             ncclDataTypeEnum.from_torch(input_tensor.dtype),
             self.comm,
-            cudaStream_t(stream.cuda_stream),
+            _stream_pointer(stream),
         )
 
     def all_gatherv(
@@ -357,7 +371,7 @@ class PyNcclCommunicator:
             f"but the input tensor is on {input_tensor.device}"
         )
         if stream is None:
-            stream = current_stream()
+            stream = self._current_stream()
         assert output_tensor.shape[0] == sum(sizes)
         split_offset = 0
         self.nccl.ncclGroupStart()
@@ -370,7 +384,7 @@ class PyNcclCommunicator:
                 ncclDataTypeEnum.from_torch(input_tensor.dtype),
                 root,
                 self.comm,
-                cudaStream_t(stream.cuda_stream),
+                _stream_pointer(stream),
             )
             split_offset += split_size
         self.nccl.ncclGroupEnd()
@@ -392,7 +406,7 @@ class PyNcclCommunicator:
             f"but the input tensor is on {input_tensor.device}"
         )
         if stream is None:
-            stream = current_stream()
+            stream = self._current_stream()
         self.nccl.ncclReduceScatter(
             buffer_type(input_tensor.data_ptr()),
             buffer_type(output_tensor.data_ptr()),
@@ -400,7 +414,7 @@ class PyNcclCommunicator:
             ncclDataTypeEnum.from_torch(input_tensor.dtype),
             ncclRedOpTypeEnum.from_torch(op),
             self.comm,
-            cudaStream_t(stream.cuda_stream),
+            _stream_pointer(stream),
         )
 
     def reduce_scatterv(
@@ -421,7 +435,7 @@ class PyNcclCommunicator:
             f"but the input tensor is on {input_tensor.device}"
         )
         if stream is None:
-            stream = current_stream()
+            stream = self._current_stream()
 
         split_offset = 0
         self.nccl.ncclGroupStart()
@@ -435,7 +449,7 @@ class PyNcclCommunicator:
                 ncclRedOpTypeEnum.from_torch(op),
                 root,
                 self.comm,
-                cudaStream_t(stream.cuda_stream),
+                _stream_pointer(stream),
             )
             split_offset += split_size
         self.nccl.ncclGroupEnd()
@@ -455,7 +469,7 @@ class PyNcclCommunicator:
             f"but the input tensor is on {input_tensor.device}"
         )
         if stream is None:
-            stream = current_stream()
+            stream = self._current_stream()
         self.nccl.ncclReduce(
             buffer_type(input_tensor.data_ptr()),
             buffer_type(output_tensor.data_ptr()),
@@ -464,7 +478,7 @@ class PyNcclCommunicator:
             ncclRedOpTypeEnum.from_torch(op),
             root,
             self.comm,
-            cudaStream_t(stream.cuda_stream),
+            _stream_pointer(stream),
         )
 
     def scatter(
@@ -482,7 +496,7 @@ class PyNcclCommunicator:
             f"but the output tensor is on {output_tensor.device}"
         )
         if stream is None:
-            stream = current_stream()
+            stream = self._current_stream()
         self.nccl.ncclGroupStart()
         if self.rank == root:
             split_offset = 0
@@ -508,7 +522,7 @@ class PyNcclCommunicator:
             f"but the input tensor is on {tensor.device}"
         )
         if stream is None:
-            stream = current_stream()
+            stream = self._current_stream()
         if tensor.dtype in [
             torch.float8_e5m2,
             torch.float8_e4m3fn,
@@ -524,7 +538,7 @@ class PyNcclCommunicator:
             nccl_dtype,
             dst,
             self.comm,
-            cudaStream_t(stream.cuda_stream),
+            _stream_pointer(stream),
         )
 
     def recv(self, tensor: torch.Tensor, src: int, stream=None):
@@ -535,7 +549,7 @@ class PyNcclCommunicator:
             f"but the input tensor is on {tensor.device}"
         )
         if stream is None:
-            stream = current_stream()
+            stream = self._current_stream()
         if tensor.dtype in [
             torch.float8_e5m2,
             torch.float8_e4m3fn,
@@ -551,7 +565,7 @@ class PyNcclCommunicator:
             nccl_dtype,
             src,
             self.comm,
-            cudaStream_t(stream.cuda_stream),
+            _stream_pointer(stream),
         )
 
     def broadcast(self, tensor: torch.Tensor, src: int, stream=None):
@@ -562,7 +576,7 @@ class PyNcclCommunicator:
             f"but the input tensor is on {tensor.device}"
         )
         if stream is None:
-            stream = current_stream()
+            stream = self._current_stream()
         if src == self.rank:
             sendbuff = buffer_type(tensor.data_ptr())
             # NCCL requires the sender also to have a receive buffer
@@ -577,7 +591,7 @@ class PyNcclCommunicator:
             ncclDataTypeEnum.from_torch(tensor.dtype),
             src,
             self.comm,
-            cudaStream_t(stream.cuda_stream),
+            _stream_pointer(stream),
         )
 
     def group_start(self):
@@ -625,7 +639,7 @@ class PyNcclCommunicator:
         if self.disabled:
             return
         if stream is None:
-            stream = current_stream()
+            stream = self._current_stream()
         self.group_start()
         for op in p2p_ops:
             if op.op is torch.distributed.isend:

@@ -830,6 +830,13 @@ class GroupCoordinator:
         # Bypass the function if we are using only 1 GPU.
         if self.world_size == 1:
             return input_
+        if (
+            envs.VLLM_USE_PLAIT
+            and self.unique_name.split(":")[0] == "tp"
+            and input_.device.type != "cpu"
+        ):
+            assert self.device_communicator is not None
+            return self.device_communicator.broadcast(input_, src)
         # Broadcast.
         torch.distributed.broadcast(
             input_, src=self.ranks[src], group=self.device_group
@@ -1479,15 +1486,34 @@ def init_model_parallel_group(
     use_device_communicator: bool = True,
     use_all2all: bool = False,
 ) -> GroupCoordinator:
-    return GroupCoordinator(
+    use_plait = envs.VLLM_USE_PLAIT and group_name == "tp" and use_device_communicator
+    group = GroupCoordinator(
         group_ranks=group_ranks,
         local_rank=local_rank,
         torch_distributed_backend=backend,
-        use_device_communicator=use_device_communicator,
+        use_device_communicator=use_device_communicator and not use_plait,
         use_message_queue_broadcaster=use_message_queue_broadcaster,
         group_name=group_name,
         use_all2all=use_all2all,
     )
+    if use_plait and group.world_size > 1:
+        from vllm.distributed.device_communicators.plait_communicator import (
+            PlaitCommunicator,
+        )
+        from vllm.platforms import current_platform
+
+        device = group.device
+        if isinstance(device, int):
+            device = torch.device(current_platform.device_type, device)
+        try:
+            group.device_communicator = PlaitCommunicator(
+                group.cpu_group, device, group.unique_name
+            )
+        except Exception:
+            group.destroy()
+            raise
+        group.use_device_communicator = True
+    return group
 
 
 def _init_stateless_group(
