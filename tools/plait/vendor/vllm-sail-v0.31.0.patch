@@ -1,0 +1,34 @@
+--- a/vllm_sail/platform.py
++++ b/vllm_sail/platform.py
+@@ -2,11 +2,11 @@
+ """The PPU platform.
+ 
+ PPU hardware is CUDA-compatible, so this class inherits
+-:class:`vllm.platforms.cuda.NvmlCudaPlatform` and reuses upstream vLLM's CUDA
++:class:`vllm.platforms.cuda.CudaPlatform` and reuses upstream vLLM's CUDA
+ attention backends, distributed communication, compilation and kernel
+ infrastructure wholesale. Only genuine PPU differences are overridden.
+ 
+-Deliberately inherited from ``NvmlCudaPlatform`` (do not re-implement):
++Deliberately inherited from ``CudaPlatform`` (do not re-implement):
+ ``set_device``, ``get_current_memory_usage``, ``get_vit_attn_backend``,
+ ``get_punica_wrapper``, ``get_device_communicator_cls``, ``supports_fp8``,
+ ``opaque_attention_op``, ``get_static_graph_wrapper_cls``,
+@@ -24,7 +24,7 @@
+ 
+ import torch
+ from vllm.logger import init_logger
+-from vllm.platforms.cuda import NvmlCudaPlatform
++from vllm.platforms.cuda import CudaPlatform
+ from vllm.platforms.interface import DeviceCapability, PlatformEnum
+ from vllm.v1.attention.backends.registry import AttentionBackendEnum
+ 
+@@ -73,7 +73,7 @@
+     ]
+ 
+ 
+-class PPUPlatform(NvmlCudaPlatform):
++class PPUPlatform(CudaPlatform):
+     """vLLM platform for PPU accelerators.
+ 
+     ``_enum`` is deliberately ``PlatformEnum.CUDA`` rather than

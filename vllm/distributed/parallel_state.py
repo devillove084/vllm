@@ -1390,11 +1390,17 @@ class GroupCoordinator:
         # Release them before destroying the groups they depend on.
         if self.device_communicator is not None:
             self.device_communicator.destroy()
+            self.device_communicator = None
+        # A device runtime may shut down the default process group before
+        # the engine finalizer runs. That also destroys its subgroups.
+        groups_initialized = torch.distributed.is_initialized()
         if hasattr(self, "device_group"):
-            torch.distributed.destroy_process_group(self.device_group)
+            if groups_initialized:
+                torch.distributed.destroy_process_group(self.device_group)
             del self.device_group
         if hasattr(self, "cpu_group"):
-            torch.distributed.destroy_process_group(self.cpu_group)
+            if groups_initialized:
+                torch.distributed.destroy_process_group(self.cpu_group)
             del self.cpu_group
         if self.mq_broadcaster is not None:
             self.mq_broadcaster = None

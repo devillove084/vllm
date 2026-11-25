@@ -1,0 +1,57 @@
+diff --git a/vllm_ascend/distributed/parallel_state.py b/vllm_ascend/distributed/parallel_state.py
+index 433d7e4..3d24441 100644
+--- a/vllm_ascend/distributed/parallel_state.py
++++ b/vllm_ascend/distributed/parallel_state.py
+@@ -1,6 +1,7 @@
+ from typing import TYPE_CHECKING
+ 
+ import torch
++from vllm import envs as vllm_envs
+ from vllm.config import ParallelConfig, get_current_vllm_config
+ from vllm.distributed import parallel_state as vllm_parallel_state
+ from vllm.distributed.parallel_state import (
+@@ -162,7 +163,13 @@ def init_ascend_model_parallel(
+     group_ranks = [x.tolist() for x in group_ranks]
+ 
+     global _MC2
+-    _MC2 = init_model_parallel_group(group_ranks, get_world_group().local_rank, backend, group_name="mc2")
++    if vllm_envs.VLLM_USE_PLAIT:
++        tp_group = vllm_parallel_state.get_tp_group()
++        if group_ranks != [tp_group.ranks]:
++            raise ValueError("Plait TP requires the Ascend MC2 ranks to match the TP group")
++        _MC2 = tp_group
++    else:
++        _MC2 = init_model_parallel_group(group_ranks, get_world_group().local_rank, backend, group_name="mc2")
+ 
+     if get_ascend_config().eplb_config.dynamic_eplb:
+         global _DYNAMIC_EPLB
+@@ -267,7 +274,7 @@ def destroy_ascend_model_parallel():
+     _KVPP = None
+ 
+     global _MC2
+-    if _MC2:
++    if _MC2 and not vllm_envs.VLLM_USE_PLAIT:
+         _MC2.destroy()
+     _MC2 = None
+ 
+diff --git a/vllm_ascend/patch/worker/patch_distributed.py b/vllm_ascend/patch/worker/patch_distributed.py
+index f5dd4d4..0a3e373 100644
+--- a/vllm_ascend/patch/worker/patch_distributed.py
++++ b/vllm_ascend/patch/worker/patch_distributed.py
+@@ -22,6 +22,7 @@ from typing import Any, cast
+ import torch
+ import vllm
+ from torch.distributed import Backend
++from vllm import envs as vllm_envs
+ from vllm.distributed.parallel_state import GroupCoordinator, _get_unique_name, _register_group
+ 
+ from vllm_ascend.distributed.device_communicators.npu_communicator import NPUCommunicator
+@@ -250,5 +251,6 @@ class GroupCoordinatorPatch(GroupCoordinator):
+         return True
+ 
+ 
+-vllm.distributed.parallel_state.GroupCoordinator = GroupCoordinatorPatch
+-_patch_destroy_distributed_environment()
++if not vllm_envs.VLLM_USE_PLAIT:
++    vllm.distributed.parallel_state.GroupCoordinator = GroupCoordinatorPatch
++    _patch_destroy_distributed_environment()
