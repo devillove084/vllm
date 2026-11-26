@@ -234,6 +234,7 @@ class PlaitKvConnector(KVConnectorBase_V1):
             raise ValueError("invalid Plait KV store timeout")
         self.store = Store(address, total_heads, head_bytes, timeout)
         self.checkpoint_decode = extra.get("checkpoint_decode", False) is True
+        self.checkpoint_only = extra.get("checkpoint_only", False) is True
         self.layer_ranges = (
             LayerRanges.for_worker(
                 global_layers,
@@ -331,6 +332,8 @@ class PlaitKvConnector(KVConnectorBase_V1):
         if request.request_id in self.unavailable_requests:
             return None, False
         params = request.kv_transfer_params or {}
+        if self.checkpoint_only and params.get("plait_checkpoint") is not True:
+            return 0, False
         required = "plait_handoff" in params
         if not self._eligible(request):
             return self._reject_handoff(request) if required else (0, False)

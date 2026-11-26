@@ -93,6 +93,7 @@ def test_exports_a_page_after_async_tokens_become_known() -> None:
 
 def test_handoff_checks_all_pages_and_binds_the_prompt_tail() -> None:
     connector = object.__new__(PlaitKvConnector)
+    connector.checkpoint_only = False
     connector.block_size = 4
     connector.domain = b"test-model"
     connector.found = {}
@@ -137,6 +138,12 @@ def test_handoff_checks_all_pages_and_binds_the_prompt_tail() -> None:
     assert connector.take_unavailable_requests() == {request.request_id}
     request.kv_transfer_params = None
     assert connector.get_num_new_matched_tokens(request, 0) == (4, False)
+    connector.checkpoint_only = True
+    assert connector.get_num_new_matched_tokens(request, 0) == (0, False)
+    assert connector.found == {}
+    request.kv_transfer_params = {"plait_checkpoint": True}
+    assert connector.get_num_new_matched_tokens(request, 0) == (4, False)
+    connector.checkpoint_only = False
 
     # Resume keeps the promised prompt pages mandatory and can load complete
     # pages containing generated history. An absent optional tail is a miss.
