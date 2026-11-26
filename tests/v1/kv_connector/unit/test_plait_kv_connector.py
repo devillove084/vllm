@@ -94,6 +94,7 @@ def test_exports_a_page_after_async_tokens_become_known() -> None:
 def test_handoff_checks_all_pages_and_binds_the_prompt_tail() -> None:
     connector = object.__new__(PlaitKvConnector)
     connector.checkpoint_only = False
+    connector.checkpoint_admission = False
     connector.block_size = 4
     connector.domain = b"test-model"
     connector.found = {}
@@ -153,6 +154,36 @@ def test_handoff_checks_all_pages_and_binds_the_prompt_tail() -> None:
     present = set(keys[:3])
     request.kv_transfer_params = {**transferred, "plait_resume_token_ids": output}
     assert connector.get_num_new_matched_tokens(request, 0) == (12, False)
+    connector.checkpoint_admission = True
+    exchanges = []
+
+    def limited(verb, key, writer=None):
+        exchanges.append((verb, key, writer))
+        return b"" if verb == b"H" and key in present else None
+
+    original = connector.store.exchange
+    connector.store.exchange = limited
+    assert connector.get_num_new_matched_tokens(request, 0) == (8, False)
+    assert [verb for verb, _, _ in exchanges] == [b"H", b"H", b"h"]
+    assert exchanges[-1][2] is not None and len(exchanges[-1][2]) == 16
+    assert connector.found[request.request_id] == (0, [(keys[0], None), (keys[1], None)])
+    exchanges.clear()
+
+    def admit(verb, key, writer=None):
+        exchanges.append((verb, key, writer))
+        return b"" if key in present else None
+
+    connector.store.exchange = admit
+    assert connector.get_num_new_matched_tokens(request, 0) == (12, False)
+    blocks = SimpleNamespace(get_block_ids=lambda: ([7, 8, 9],))
+    connector.checkpoint_decode = False
+    connector.loads = []
+    connector.update_state_after_alloc(request, blocks, 12)
+    assert connector.loads == [
+        Block(keys[0], 7), Block(keys[1], 8), Block(keys[2], 9, exchanges[2][2]),
+    ]
+    connector.store.exchange = original
+    connector.checkpoint_admission = False
     present.remove(keys[1])
     assert connector.get_num_new_matched_tokens(request, 0) == (None, False)
     assert connector.take_unavailable_requests() == {request.request_id}

@@ -10,7 +10,9 @@ import re
 import socket
 import struct
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from functools import partial
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
@@ -50,6 +52,7 @@ _MAX_RANGES = 4096
 class Block:
     key: bytes
     block_id: int
+    checkpoint_lease: bytes | None = None
 
 
 @dataclass(frozen=True)
@@ -114,7 +117,7 @@ class Store:
         first: int = 0,
         count: int = 0,
         writer: bytes = bytes(16),
-        data: bytes = b"",
+        data: bytes | Callable[[], bytes] = b"",
         *,
         parts: LayerRanges | None = None,
     ) -> bytes | None:
@@ -145,15 +148,23 @@ class Store:
         with socket.create_connection(self.address, self.timeout) as connection:
             connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             connection.sendall(header)
-            if data:
-                connection.sendall(data)
             with connection.makefile("rb") as reply:
+                if verb == b"p":
+                    admitted = reply.read(1)
+                    if admitted == b"\x02":
+                        return None
+                    if admitted != _OK:
+                        raise OSError("invalid Plait KV write admission")
+                if callable(data):
+                    data = data()
+                if data:
+                    connection.sendall(data)
                 state = reply.read(1)
                 if state in (_MISS, b"\x02"):
                     return None
                 if state != _OK:
                     raise OSError("invalid Plait KV store response")
-                expected = size if verb == b"G" else 0
+                expected = size if verb in (b"G", b"g") else 0
                 payload = reply.read(expected)
                 if len(payload) != expected:
                     raise OSError("incomplete Plait KV block")
@@ -235,6 +246,10 @@ class PlaitKvConnector(KVConnectorBase_V1):
         self.store = Store(address, total_heads, head_bytes, timeout)
         self.checkpoint_decode = extra.get("checkpoint_decode", False) is True
         self.checkpoint_only = extra.get("checkpoint_only", False) is True
+        self.checkpoint_admission = extra.get("checkpoint_admission", False) is True
+        self.checkpoint_writes = (
+            self.checkpoint_admission and not self._kv_transfer_config.is_kv_producer
+        )
         self.layer_ranges = (
             LayerRanges.for_worker(
                 global_layers,
@@ -260,7 +275,7 @@ class PlaitKvConnector(KVConnectorBase_V1):
         ).encode()
         self.session = uuid.uuid4().bytes
         self.requests: dict[str, tuple[Request, int]] = {}
-        self.found: dict[str, tuple[int, list[bytes]]] = {}
+        self.found: dict[str, tuple[int, list[tuple[bytes, bytes | None]]]] = {}
         self.unavailable_requests: set[str] = set()
         self.loads: list[Block] = []
         self.invalid_blocks: set[int] = set()
@@ -361,11 +376,17 @@ class PlaitKvConnector(KVConnectorBase_V1):
         if count <= first:
             return 0, False
         hits = []
+        lease = uuid.uuid4().bytes if self.checkpoint_admission else None
         try:
-            for key in self._keys(request, count)[first:]:
-                if self.store.exchange(b"H", key) is None:
+            for page, key in enumerate(self._keys(request, count)[first:], first):
+                reservation = lease if page >= required_count else None
+                if reservation is None:
+                    hit = self.store.exchange(b"H", key)
+                else:
+                    hit = self.store.exchange(b"h", key, writer=reservation)
+                if hit is None:
                     break
-                hits.append(key)
+                hits.append((key, reservation))
         except OSError:
             logger.warning_once("Plait KV store unavailable during prefix lookup")
         if first + len(hits) < required_count:
@@ -393,8 +414,8 @@ class PlaitKvConnector(KVConnectorBase_V1):
             count = num_external_tokens // self.block_size
             (block_ids,) = blocks.get_block_ids()
             self.loads.extend(
-                Block(key, block_id)
-                for key, block_id in zip(
+                Block(key, block_id, lease)
+                for (key, lease), block_id in zip(
                     keys[:count], block_ids[first : first + count], strict=True
                 )
             )
@@ -524,10 +545,11 @@ class PlaitKvConnector(KVConnectorBase_V1):
         for block in metadata.loads:
             try:
                 data = self.store.exchange(
-                    b"G",
+                    b"g" if block.checkpoint_lease is not None else b"G",
                     block.key,
                     self.first_head,
                     self.heads,
+                    writer=block.checkpoint_lease or bytes(16),
                     parts=self.layer_ranges,
                 )
                 if data is None:
@@ -571,19 +593,13 @@ class PlaitKvConnector(KVConnectorBase_V1):
             return
         for writer, block in metadata.saves:
             try:
-                with gpu_sync_allowed():
-                    layers = []
-                    for key_cache, value_cache in self.caches:
-                        key = self._cache_page(key_cache, block.block_id).cpu()
-                        value = self._cache_page(value_cache, block.block_id).cpu()
-                        combined = torch.cat((key, value), dim=-1).transpose(0, 1)
-                        layers.append(
-                            combined.reshape(self.heads, self.block_size, self.content)
-                        )
-                    value = torch.stack(layers, dim=1)
-                    data = value.contiguous().view(torch.uint8).numpy().tobytes()
+                data = (
+                    partial(self._pack_block, block.block_id)
+                    if self.checkpoint_writes
+                    else self._pack_block(block.block_id)
+                )
                 self.store.exchange(
-                    b"P",
+                    b"p" if self.checkpoint_writes else b"P",
                     block.key,
                     self.first_head,
                     self.heads,
@@ -594,6 +610,19 @@ class PlaitKvConnector(KVConnectorBase_V1):
             except OSError:
                 logger.warning_once("Plait KV store unavailable during publication")
                 break
+
+    def _pack_block(self, block_id: int) -> bytes:
+        with gpu_sync_allowed():
+            layers = []
+            for key_cache, value_cache in self.caches:
+                key = self._cache_page(key_cache, block_id).cpu()
+                value = self._cache_page(value_cache, block_id).cpu()
+                combined = torch.cat((key, value), dim=-1).transpose(0, 1)
+                layers.append(
+                    combined.reshape(self.heads, self.block_size, self.content)
+                )
+            value = torch.stack(layers, dim=1)
+            return value.contiguous().view(torch.uint8).numpy().tobytes()
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         failures, self.invalid_blocks = self.invalid_blocks, set()

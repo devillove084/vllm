@@ -179,14 +179,15 @@ class MultiprocExecutor(Executor):
             local_ranks = self.parallel_config.local_worker_ranks
             if self.parallel_config.plait_tp_layout is not None:
                 transfer = self.vllm_config.kv_transfer_config
+                options = (
+                    transfer.kv_connector_extra_config
+                    if transfer is not None and transfer.kv_connector == "PlaitKvConnector"
+                    else {}
+                )
                 self._plait_store = agree_on_plait_layout(
                     self.parallel_config,
-                    seeded_resume=(
-                        transfer is not None
-                        and transfer.kv_connector == "PlaitKvConnector"
-                        and transfer.kv_connector_extra_config.get("seeded_resume")
-                        is True
-                    ),
+                    seeded_resume=options.get("seeded_resume") is True,
+                    checkpoint_admission=options.get("checkpoint_admission") is True,
                 )
                 logger.info(
                     "Plait worker layout %s: node_rank=%d, local worker ranks=%s",
