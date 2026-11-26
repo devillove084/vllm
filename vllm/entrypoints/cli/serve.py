@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import argparse
+import os
 import signal
 import time
 
@@ -225,7 +226,17 @@ def run_headless(args: argparse.Namespace):
             head_node_address,
         )
 
-        executor = MultiprocExecutor(vllm_config, monitor_workers=False)
+        ready_fd_text = os.environ.pop("VLLM_PLAIT_READY_FD", None)
+        ready_fd = int(ready_fd_text) if ready_fd_text is not None else None
+        if ready_fd is not None:
+            os.set_inheritable(ready_fd, False)
+        try:
+            executor = MultiprocExecutor(vllm_config, monitor_workers=False)
+            if ready_fd is not None:
+                os.write(ready_fd, b"1")
+        finally:
+            if ready_fd is not None:
+                os.close(ready_fd)
         executor.start_worker_monitor(inline=True)
         return
 
