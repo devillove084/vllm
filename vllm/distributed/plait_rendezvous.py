@@ -33,7 +33,9 @@ def _open_store(config: "ParallelConfig", *, is_master: bool) -> TCPStore:
     )
 
 
-def agree_on_plait_layout(config: "ParallelConfig") -> TCPStore:
+def agree_on_plait_layout(
+    config: "ParallelConfig", *, seeded_resume: bool = False
+) -> TCPStore:
     """Rendezvous once per host before assigning global worker ranks."""
     assert config.plait_tp_layout is not None
     launch_store = _open_store(config, is_master=config.node_rank == 0)
@@ -44,15 +46,16 @@ def agree_on_plait_layout(config: "ParallelConfig") -> TCPStore:
         raise ValueError(f"Duplicate node rank {config.node_rank} in Plait TP layout")
 
     layout = ",".join(str(count) for count in config.plait_tp_layout).encode()
-    if config.pipeline_parallel_size > 1:
-        layout = json.dumps(
-            {
-                "workers": config.plait_tp_layout,
-                "tp": config.tensor_parallel_size,
-                "pp": config.pipeline_parallel_size,
-                "layers": envs.VLLM_PP_LAYER_PARTITION,
-            }
-        ).encode()
+    if config.pipeline_parallel_size > 1 or seeded_resume:
+        plan = {
+            "workers": config.plait_tp_layout,
+            "tp": config.tensor_parallel_size,
+            "pp": config.pipeline_parallel_size,
+            "layers": envs.VLLM_PP_LAYER_PARTITION,
+        }
+        if seeded_resume:
+            plan["seeded_resume"] = True
+        layout = json.dumps(plan).encode()
     store.set(key, layout)
     try:
         store.wait(keys)
@@ -64,7 +67,8 @@ def agree_on_plait_layout(config: "ParallelConfig") -> TCPStore:
     observed = [store.get(key) for key in keys]
     if any(other != layout for other in observed):
         raise ValueError(
-            "Inconsistent --plait-tp-layout, TP/PP sizes or layer partition: "
+            "Inconsistent --plait-tp-layout, TP/PP sizes, layer partition "
+            "or seeded resume: "
             + ", ".join(plan.decode() for plan in observed)
         )
     return launch_store

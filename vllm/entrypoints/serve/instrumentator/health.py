@@ -28,6 +28,17 @@ async def health(raw_request: Request) -> Response:
         return Response(status_code=200)
     try:
         await client.check_health()
-        return Response(status_code=200)
+        config = client.vllm_config
+        transfer = config.kv_transfer_config
+        headers = {}
+        if (
+            config.use_v2_model_runner
+            and transfer is not None
+            and transfer.kv_connector == "PlaitKvConnector"
+            and transfer.is_kv_consumer
+            and transfer.get_from_extra_config("seeded_resume", False) is True
+        ):
+            headers["X-Plait-KV-Resume"] = "seeded-v2"
+        return Response(status_code=200, headers=headers)
     except EngineDeadError:
         return Response(status_code=503)

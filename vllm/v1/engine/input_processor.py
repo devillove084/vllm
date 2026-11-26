@@ -447,14 +447,19 @@ class InputProcessor:
             if sampling_params.trace_decode_token_ids:
                 self._normalize_trace_replay_params(sampling_params, prompt_len)
             kv_params = (sampling_params.extra_args or {}).get("kv_transfer_params")
-            if isinstance(kv_params, dict) and "plait_resume_token_ids" in kv_params:
+            if isinstance(kv_params, dict) and (
+                "plait_resume_token_ids" in kv_params
+                or "plait_sampling_mode" in kv_params
+            ):
                 if decoder_input["type"] != "token" or lora_request or resumable:
                     raise VLLMValidationError(
                         "Plait resume requires a plain token prompt"
                     )
-                plait_resume_token_ids = self._validate_plait_resume(
-                    kv_params["plait_resume_token_ids"], sampling_params, prompt_len
-                )
+                self._validate_plait_stream(kv_params, sampling_params)
+                if "plait_resume_token_ids" in kv_params:
+                    plait_resume_token_ids = self._validate_plait_resume_tokens(
+                        kv_params["plait_resume_token_ids"], sampling_params, prompt_len
+                    )
         else:
             pooling_params = params.clone()
 
@@ -516,9 +521,9 @@ class InputProcessor:
             plait_resume_token_ids=plait_resume_token_ids,
         )
 
-    def _validate_plait_resume(
-        self, tokens: object, params: SamplingParams, prompt_len: int
-    ) -> list[int]:
+    def _validate_plait_stream(
+        self, kv_params: dict[str, Any], params: SamplingParams
+    ) -> None:
         config = self.vllm_config
         transfer = config.kv_transfer_config
         if (
@@ -529,9 +534,24 @@ class InputProcessor:
             or config.speculative_config is not None
         ):
             raise VLLMValidationError("Plait resume requires a V2 Plait KV consumer")
+        if "plait_sampling_mode" in kv_params:
+            if (
+                kv_params["plait_sampling_mode"] != "seeded-v2"
+                or not 0 < params.temperature < float("inf")
+                or type(params.seed) is not int
+                or not -(1 << 63) <= params.seed < (1 << 63)
+                or params.seed == -1
+                or transfer.kv_connector_extra_config.get("seeded_resume") is not True
+                or config.model_config.use_fp64_gumbel
+                or config.watermark_config is not None
+            ):
+                raise VLLMValidationError(
+                    "Plait seeded resume requires the seeded V2 sampler"
+                )
+        elif params.temperature != 0:
+            raise VLLMValidationError("Plait resume requires greedy or seeded sampling")
         if (
             params.n != 1
-            or params.temperature != 0
             or params.output_kind != RequestOutputKind.DELTA
             or params.logprobs is not None
             or params.logprob_token_ids is not None
@@ -542,7 +562,13 @@ class InputProcessor:
             or params.thinking_token_budget is not None
             or params.trace_decode_token_ids is not None
         ):
-            raise VLLMValidationError("Plait resume requires one plain greedy stream")
+            raise VLLMValidationError(
+                "Plait resume requires one plain completion stream"
+            )
+
+    def _validate_plait_resume_tokens(
+        self, tokens: object, params: SamplingParams, prompt_len: int
+    ) -> list[int]:
         vocab_size = self.model_config.get_vocab_size()
         if (
             not isinstance(tokens, list)

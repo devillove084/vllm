@@ -493,6 +493,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         self.vllm_config.watermark_config
                     ),
                 )
+            transfer = self.vllm_config.kv_transfer_config
+            if (
+                transfer is not None
+                and transfer.kv_connector == "PlaitKvConnector"
+                and transfer.kv_connector_extra_config.get("seeded_resume") is True
+                and (
+                    type(self.sampler) is not Sampler
+                    or self.model_config.use_fp64_gumbel
+                    or self.speculative_config is not None
+                    or custom_logits_processors
+                )
+            ):
+                raise ValueError(
+                    "Plait seeded resume requires the standard FP32 V2 sampler"
+                )
             self.prompt_logprobs_worker = PromptLogprobsWorker(
                 self.max_num_reqs,
                 self.device,

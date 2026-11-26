@@ -2,12 +2,16 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from types import SimpleNamespace
+from unittest import TestCase
 
 from vllm.distributed.kv_transfer.kv_connector.v1.plait_kv_connector import (
     Block,
     LayerRanges,
     PlaitKvConnector,
 )
+from vllm.exceptions import VLLMValidationError
+from vllm.sampling_params import RequestOutputKind, SamplingParams
+from vllm.v1.engine.input_processor import InputProcessor
 from vllm.v1.request import RequestStatus
 
 
@@ -17,6 +21,43 @@ def test_pipeline_stage_merges_only_adjacent_global_head_and_layer_slots() -> No
     ranges = LayerRanges.for_worker(layers, local_layers, 4, 1, 2, 128)
     assert ranges.part_bytes == 128
     assert ranges.ranges == ((4, 2), (7, 3), (11, 1))
+
+
+def test_seeded_stream_requires_the_explicit_sampler_contract() -> None:
+    processor = object.__new__(InputProcessor)
+    processor.model_config = SimpleNamespace(
+        get_vocab_size=lambda: 32, max_model_len=64, use_fp64_gumbel=False
+    )
+    extra = {"seeded_resume": True}
+    processor.vllm_config = SimpleNamespace(
+        model_config=processor.model_config,
+        kv_transfer_config=SimpleNamespace(
+            kv_connector="PlaitKvConnector",
+            is_kv_consumer=True,
+            kv_connector_extra_config=extra,
+        ),
+        use_v2_model_runner=True,
+        speculative_config=None,
+        watermark_config=None,
+    )
+    params = SamplingParams(
+        temperature=0.8, seed=42, max_tokens=4, output_kind=RequestOutputKind.DELTA
+    )
+    mode = {"plait_sampling_mode": "seeded-v2"}
+    processor._validate_plait_stream(mode, params)
+    assert processor._validate_plait_resume_tokens([7, 8], params, 12) == [7, 8]
+
+    with TestCase().assertRaises(VLLMValidationError):
+        processor._validate_plait_stream({}, params)
+    extra["seeded_resume"] = False
+    with TestCase().assertRaises(VLLMValidationError):
+        processor._validate_plait_stream(mode, params)
+    extra["seeded_resume"] = True
+    params.seed = None
+    with TestCase().assertRaises(VLLMValidationError):
+        processor._validate_plait_stream(mode, params)
+    params.temperature = 0
+    processor._validate_plait_stream({}, params)
 
 
 def test_exports_a_page_after_async_tokens_become_known() -> None:

@@ -178,7 +178,16 @@ class MultiprocExecutor(Executor):
         try:
             local_ranks = self.parallel_config.local_worker_ranks
             if self.parallel_config.plait_tp_layout is not None:
-                self._plait_store = agree_on_plait_layout(self.parallel_config)
+                transfer = self.vllm_config.kv_transfer_config
+                self._plait_store = agree_on_plait_layout(
+                    self.parallel_config,
+                    seeded_resume=(
+                        transfer is not None
+                        and transfer.kv_connector == "PlaitKvConnector"
+                        and transfer.kv_connector_extra_config.get("seeded_resume")
+                        is True
+                    ),
+                )
                 logger.info(
                     "Plait worker layout %s: node_rank=%d, local worker ranks=%s",
                     self.parallel_config.plait_tp_layout,

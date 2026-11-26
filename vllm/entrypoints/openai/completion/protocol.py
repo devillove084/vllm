@@ -676,6 +676,7 @@ class CompletionResponseStreamChoice(OpenAIBaseModel):
     prompt_token_ids: list[int] | None = None
     token_ids: list[int] | None = None
     plait_resumed_tokens: int | None = None
+    plait_sampled_seed: int | None = None
 
 
 class CompletionStreamResponse(OpenAIBaseModel):
