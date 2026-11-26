@@ -96,3 +96,40 @@ def test_handoff_checks_all_pages_and_binds_the_prompt_tail() -> None:
     assert connector.take_unavailable_requests() == {request.request_id}
     request.kv_transfer_params = None
     assert connector.get_num_new_matched_tokens(request, 0) == (4, False)
+
+    # Resume keeps the promised prompt pages mandatory and can load complete
+    # pages containing generated history. An absent optional tail is a miss.
+    output = list(range(20, 29))
+    request.all_token_ids = request.prompt_token_ids + output
+    keys = connector._keys(request, 4)
+    present = set(keys[:3])
+    request.kv_transfer_params = {**transferred, "plait_resume_token_ids": output}
+    assert connector.get_num_new_matched_tokens(request, 0) == (12, False)
+    present.remove(keys[1])
+    assert connector.get_num_new_matched_tokens(request, 0) == (None, False)
+    assert connector.take_unavailable_requests() == {request.request_id}
+
+
+def test_decode_checkpoint_publication_requires_profile_and_request_opt_in() -> None:
+    connector = object.__new__(PlaitKvConnector)
+    connector.requests = {}
+    connector.found = {}
+    connector._kv_transfer_config = SimpleNamespace(is_kv_producer=False)
+    request = SimpleNamespace(
+        request_id="stream",
+        prompt_token_ids=[1],
+        prompt_embeds=None,
+        mm_features=[],
+        lora_request=None,
+        kv_transfer_params={"plait_checkpoint": True},
+    )
+    connector.checkpoint_decode = False
+    connector.update_state_after_alloc(request, None, 0)
+    assert connector.requests == {}
+    connector.checkpoint_decode = True
+    request.kv_transfer_params = {}
+    connector.update_state_after_alloc(request, None, 0)
+    assert connector.requests == {}
+    request.kv_transfer_params = {"plait_checkpoint": True}
+    connector.update_state_after_alloc(request, None, 0)
+    assert connector.requests == {"stream": (request, 0)}

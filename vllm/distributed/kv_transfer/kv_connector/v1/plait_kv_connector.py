@@ -233,6 +233,7 @@ class PlaitKvConnector(KVConnectorBase_V1):
         if not 0 < timeout <= 15:
             raise ValueError("invalid Plait KV store timeout")
         self.store = Store(address, total_heads, head_bytes, timeout)
+        self.checkpoint_decode = extra.get("checkpoint_decode", False) is True
         self.layer_ranges = (
             LayerRanges.for_worker(
                 global_layers,
@@ -336,6 +337,9 @@ class PlaitKvConnector(KVConnectorBase_V1):
         if required and not request.prompt_token_ids:
             return self._reject_handoff(request)
         first = num_computed_tokens // self.block_size
+        required_count = 0
+        # Leave one known input for the forward that produces the next logits.
+        count = (len(request.all_token_ids) - 1) // self.block_size
         if required:
             receipt = params["plait_handoff"]
             ticket = self._handoff_ticket(receipt)
@@ -346,12 +350,11 @@ class PlaitKvConnector(KVConnectorBase_V1):
                 or self._kv_transfer_config.kv_load_failure_policy != "fail"
             ):
                 return self._reject_handoff(request)
-            count = receipt["cached_tokens"] // self.block_size
-            if first < count and request.skip_reading_prefix_cache:
+            required_count = receipt["cached_tokens"] // self.block_size
+            if first < required_count and request.skip_reading_prefix_cache:
                 return self._reject_handoff(request)
-        else:
-            # Keep one input token for the forward that produces the next logits.
-            count = (len(request.all_token_ids) - 1) // self.block_size
+            if not params.get("plait_resume_token_ids"):
+                count = required_count
         if count <= first:
             return 0, False
         hits = []
@@ -362,7 +365,7 @@ class PlaitKvConnector(KVConnectorBase_V1):
                 hits.append(key)
         except OSError:
             logger.warning_once("Plait KV store unavailable during prefix lookup")
-        if required and len(hits) != count - first:
+        if first + len(hits) < required_count:
             return self._reject_handoff(request)
         if hits:
             self.found[request.request_id] = (first, hits)
@@ -374,7 +377,11 @@ class PlaitKvConnector(KVConnectorBase_V1):
         blocks: KVCacheBlocks,
         num_external_tokens: int,
     ) -> None:
-        if self._kv_transfer_config.is_kv_producer and self._eligible(request):
+        params = request.kv_transfer_params or {}
+        checkpoint = self.checkpoint_decode and params.get("plait_checkpoint") is True
+        if (self._kv_transfer_config.is_kv_producer or checkpoint) and self._eligible(
+            request
+        ):
             self.requests.setdefault(request.request_id, (request, 0))
         match = self.found.pop(request.request_id, None)
         if num_external_tokens:
