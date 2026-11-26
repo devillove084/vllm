@@ -296,6 +296,12 @@ class ParallelConfig:
     nnodes: int = Field(default=1, ge=1)
     """num of nodes for multi-node distributed
     inference when distributed_executor_backend is mp."""
+    plait_tp_layout: tuple[int, ...] | None = None
+    """Local TP worker counts in node-rank order for a multi-node Plait group.
+
+    Supply one positive count per node on every host. The counts must sum to
+    tensor_parallel_size.
+    """
     numa_bind: bool = False
     """Enable NUMA binding for GPU worker subprocesses.
 
@@ -787,7 +793,17 @@ class ParallelConfig:
 
     @property
     def local_world_size(self) -> int:
+        if self.plait_tp_layout is not None:
+            return self.plait_tp_layout[self.node_rank]
         return self.world_size // self.nnodes_within_dp
+
+    @property
+    def local_worker_ranks(self) -> range:
+        if self.plait_tp_layout is not None:
+            start = sum(self.plait_tp_layout[: self.node_rank])
+        else:
+            start = self.local_world_size * self.node_rank_within_dp
+        return range(start, start + self.local_world_size)
 
     @staticmethod
     def has_unfinished_dp(dp_group: ProcessGroup, has_unfinished: bool) -> bool:
@@ -867,6 +883,7 @@ class ParallelConfig:
             "master_port",
             "node_rank",
             "nnodes",
+            "plait_tp_layout",
             "max_parallel_loading_workers",
             "disable_custom_all_reduce",
             "ray_workers_use_nsight",
@@ -1079,6 +1096,33 @@ class ParallelConfig:
     def _verify_args(self) -> Self:
         # Lazy import to avoid circular import
         from vllm.v1.executor import Executor
+
+        layout = self.plait_tp_layout
+        if layout is not None:
+            if (
+                not envs.VLLM_USE_PLAIT
+                or self.nnodes < 2
+                or self.distributed_executor_backend != "mp"
+                or self.data_parallel_size != 1
+                or self.data_parallel_size_local != 1
+                or self.pipeline_parallel_size != 1
+                or self.prefill_context_parallel_size != 1
+            ):
+                raise ValueError(
+                    "--plait-tp-layout requires VLLM_USE_PLAIT=1, the multi-node "
+                    "mp executor, and a single TP group (DP, PP and PCP sizes of 1)"
+                )
+            if (
+                len(layout) != self.nnodes
+                or any(count < 1 for count in layout)
+                or sum(layout) != self.tensor_parallel_size
+            ):
+                raise ValueError(
+                    "--plait-tp-layout requires one positive worker count per "
+                    "node, summing to --tensor-parallel-size"
+                )
+            if self.node_rank >= self.nnodes:
+                raise ValueError("--node-rank must be less than --nnodes")
 
         # Enable batch invariance settings if requested
         if envs.VLLM_BATCH_INVARIANT:

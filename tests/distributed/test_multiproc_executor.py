@@ -9,18 +9,105 @@ focusing on executor initialization, RPC calls, and distributed execution.
 import multiprocessing
 import os
 import socket
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
 from tests.utils import multi_gpu_test
-from vllm.config import VllmConfig
+from vllm.config import ParallelConfig, VllmConfig
+from vllm.distributed.plait_rendezvous import agree_on_plait_layout
 from vllm.engine.arg_utils import EngineArgs
 from vllm.platforms import current_platform
+from vllm.utils.network_utils import get_open_port
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.executor import multiproc_executor
 from vllm.v1.executor.multiproc_executor import MultiprocExecutor
 
 MODEL = "facebook/opt-125m"
+
+
+@pytest.mark.parametrize(
+    "layout,nnodes,expected",
+    [
+        ((2, 1, 1), 3, [[0, 1], [2], [3]]),
+        (None, 2, [[0, 1], [2, 3]]),
+    ],
+)
+def test_multiproc_executor_host_rank_ranges(monkeypatch, layout, nnodes, expected):
+    monkeypatch.setenv("VLLM_USE_PLAIT", "1")
+    for node_rank, ranks in enumerate(expected):
+        config = ParallelConfig(
+            tensor_parallel_size=4,
+            distributed_executor_backend="mp",
+            nnodes=nnodes,
+            node_rank=node_rank,
+            plait_tp_layout=layout,
+        )
+        executor = object.__new__(MultiprocExecutor)
+        executor.parallel_config = config
+        assert executor._get_parallel_sizes() == (4, 1, 1)
+        assert executor.local_world_size == len(ranks)
+        assert list(config.local_worker_ranks) == ranks
+
+
+@pytest.mark.parametrize("layout", [(2, 2), (3, 1, 1), (3, 1, 0)])
+def test_plait_layout_rejects_invalid_worker_counts(monkeypatch, layout):
+    monkeypatch.setenv("VLLM_USE_PLAIT", "1")
+    with pytest.raises(ValueError, match="one positive worker count"):
+        ParallelConfig(
+            tensor_parallel_size=4,
+            distributed_executor_backend="mp",
+            nnodes=3,
+            plait_tp_layout=layout,
+        )
+
+
+def test_plait_layout_rejects_conflicting_host_placements(monkeypatch):
+    monkeypatch.setenv("VLLM_USE_PLAIT", "1")
+    port = get_open_port()
+    configs = [
+        ParallelConfig(
+            tensor_parallel_size=4,
+            distributed_executor_backend="mp",
+            nnodes=3,
+            node_rank=rank,
+            master_addr="127.0.0.1",
+            master_port=port,
+            cpu_distributed_timeout_seconds=10,
+            plait_tp_layout=layout,
+        )
+        for rank, layout in enumerate(((2, 1, 1), (2, 1, 1), (1, 1, 2)))
+    ]
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        attempts = [pool.submit(agree_on_plait_layout, config) for config in configs]
+        with pytest.raises(ValueError, match="Inconsistent --plait-tp-layout"):
+            attempts[0].result()
+        assert all(attempt.exception() is not None for attempt in attempts[1:])
+
+
+def test_worker_ready_preserves_local_spawn_order():
+    handles = []
+    for rank in (1, 2):
+        reader, writer = multiprocessing.Pipe(duplex=False)
+        with writer:
+            writer.send(
+                {
+                    "status": "READY",
+                    "handle": multiproc_executor.Handle(),
+                    "peer_response_handles": [],
+                }
+            )
+        handles.append(
+            multiproc_executor.UnreadyWorkerProcHandle(
+                multiprocessing.Process(), rank, reader
+            )
+        )
+    try:
+        ready = multiproc_executor.WorkerProc.wait_for_ready(handles)
+        assert [worker.rank for worker in ready] == [1, 2]
+    finally:
+        for handle in handles:
+            handle.ready_pipe.close()
 
 
 @pytest.mark.parametrize(

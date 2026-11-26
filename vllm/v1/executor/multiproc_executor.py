@@ -41,6 +41,7 @@ from vllm.distributed.parallel_state import (
     get_tp_group,
     model_parallel_is_initialized,
 )
+from vllm.distributed.plait_rendezvous import agree_on_plait_layout
 from vllm.envs import enable_envs_cache
 from vllm.logger import configure_logging, init_logger
 from vllm.platforms import current_platform
@@ -121,6 +122,7 @@ class MultiprocExecutor(Executor):
         self._finalizer = weakref.finalize(self, self.shutdown)
         self.is_failed = False
         self.failure_callback: FailureCallback | None = None
+        self._plait_store: torch.distributed.TCPStore | None = None
 
         tp_size, pp_size, pcp_size = self._get_parallel_sizes()
         assert self.world_size == tp_size * pp_size * pcp_size, (
@@ -174,9 +176,15 @@ class MultiprocExecutor(Executor):
         unready_workers: list[UnreadyWorkerProcHandle] = []
         success = False
         try:
-            global_start_rank = (
-                self.local_world_size * self.parallel_config.node_rank_within_dp
-            )
+            local_ranks = self.parallel_config.local_worker_ranks
+            if self.parallel_config.plait_tp_layout is not None:
+                self._plait_store = agree_on_plait_layout(self.parallel_config)
+                logger.info(
+                    "Plait TP layout %s: node_rank=%d, local worker ranks=%s",
+                    self.parallel_config.plait_tp_layout,
+                    self.parallel_config.node_rank,
+                    local_ranks,
+                )
             # When using fork, keep track of socket file descriptors that are
             # inherited by the worker, so that we can close them in subsequent
             # workers
@@ -186,8 +194,7 @@ class MultiprocExecutor(Executor):
 
             # For CPU backend only, to setup OpenMP threads affinity
             cpu_omp_manager = OMPProcessManager(self.vllm_config)
-            for local_rank in range(self.local_world_size):
-                global_rank = global_start_rank + local_rank
+            for local_rank, global_rank in enumerate(local_ranks):
                 is_driver_worker = self._is_driver_worker(global_rank)
                 with cpu_omp_manager.configure_omp_envs(
                     rank=global_rank, local_rank=local_rank
@@ -262,6 +269,7 @@ class MultiprocExecutor(Executor):
                         uw.death_writer.close()
                         uw.death_writer = None
                 self._ensure_worker_termination([uw.proc for uw in unready_workers])
+                self._plait_store = None
 
         self.output_rank = self._get_output_rank()
 
@@ -278,11 +286,12 @@ class MultiprocExecutor(Executor):
 
     def _get_parallel_sizes(self) -> tuple[int, int, int]:
         self.world_size = self.parallel_config.world_size
-        assert self.world_size % self.parallel_config.nnodes_within_dp == 0, (
-            f"global world_size ({self.parallel_config.world_size}) must be "
-            f"divisible by nnodes_within_dp "
-            f"({self.parallel_config.nnodes_within_dp}). "
-        )
+        if self.parallel_config.plait_tp_layout is None:
+            assert self.world_size % self.parallel_config.nnodes_within_dp == 0, (
+                f"global world_size ({self.parallel_config.world_size}) must be "
+                f"divisible by nnodes_within_dp "
+                f"({self.parallel_config.nnodes_within_dp}). "
+            )
         self.local_world_size = self.parallel_config.local_world_size
         tp_size = self.parallel_config.tensor_parallel_size
         pp_size = self.parallel_config.pipeline_parallel_size
@@ -534,6 +543,7 @@ class MultiprocExecutor(Executor):
                 mq.shutdown()
             self.response_mqs = []
 
+        self._plait_store = None
         logger.debug_once("[shutdown] Executor: complete")
 
     def check_health(self) -> None:
@@ -786,7 +796,10 @@ class WorkerProc:
             "background process. See stack trace for root cause."
         )
 
-        pipes = {handle.ready_pipe: handle for handle in unready_proc_handles}
+        pipes = {
+            handle.ready_pipe: (index, handle)
+            for index, handle in enumerate(unready_proc_handles)
+        }
         ready_proc_handles: list[WorkerProcHandle | None] = [None] * len(
             unready_proc_handles
         )
@@ -796,12 +809,11 @@ class WorkerProc:
                 assert isinstance(pipe, Connection)
                 try:
                     # Wait until the WorkerProc is ready.
-                    unready_proc_handle = pipes.pop(pipe)
+                    idx, unready_proc_handle = pipes.pop(pipe)
                     response: dict[str, Any] = pipe.recv()
                     if response["status"] != "READY":
                         raise e
 
-                    idx = unready_proc_handle.rank % len(ready_proc_handles)
                     ready_proc_handles[idx] = WorkerProc.wait_for_response_handle_ready(
                         response, unready_proc_handle
                     )

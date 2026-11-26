@@ -448,7 +448,10 @@ def plan_local_ranks(parallel_config: ParallelConfig) -> list[tuple[int, int, in
     """
     tp_size = parallel_config.tensor_parallel_size
     world_size = parallel_config.data_parallel_size * tp_size
-    if parallel_config.nnodes > 1:
+    if parallel_config.plait_tp_layout is not None:
+        ranks = parallel_config.local_worker_ranks
+        local_world_size, base = len(ranks), ranks.start
+    elif parallel_config.nnodes > 1:
         local_world_size = world_size // parallel_config.nnodes
         base = parallel_config.node_rank * local_world_size
     else:
@@ -479,7 +482,10 @@ def _reject_unsupported_parallelism(parallel_config: ParallelConfig) -> None:
     tp_size = parallel_config.tensor_parallel_size
     if parallel_config.nnodes > 1:
         world_size = dp_size * tp_size
-        if world_size % parallel_config.nnodes != 0:
+        if (
+            parallel_config.plait_tp_layout is None
+            and world_size % parallel_config.nnodes != 0
+        ):
             raise ValueError(
                 f"--nnodes ({parallel_config.nnodes}) must evenly divide the "
                 f"daemon world size ({world_size} = data-parallel-size "

@@ -47,6 +47,7 @@ import vllm.envs as envs
 from vllm.distributed.device_communicators.base_device_communicator import (
     DeviceCommunicatorBase,
 )
+from vllm.distributed.plait_rendezvous import plait_worker_store
 from vllm.distributed.utils import (
     StatelessProcessGroup,
     get_cached_tcp_store_client,
@@ -1895,7 +1896,9 @@ def init_distributed_environment(
             )
             backend = "gloo"
         store = None
-        if distributed_init_method.startswith("file://"):
+        if config is not None and config.parallel_config.plait_tp_layout is not None:
+            store = plait_worker_store(config.parallel_config)
+        elif distributed_init_method.startswith("file://"):
             store = torch.distributed.FileStore(
                 distributed_init_method.removeprefix("file://"), world_size
             )

@@ -33,7 +33,6 @@ from zmq import (  # type: ignore
 import vllm.envs as envs
 from vllm.distributed.utils import StatelessProcessGroup, sched_yield
 from vllm.logger import init_logger
-from vllm.platforms import current_platform
 from vllm.utils.cpu_resource_utils import check_cgroup_memory_available
 from vllm.utils.network_utils import (
     get_ip,
@@ -962,15 +961,13 @@ class MessageQueue:
             and a list of handles (only non-empty for the reader process).
 
         """
-        from vllm.platforms.interface import get_assigned_physical_gpu_ids
+        from vllm.distributed.parallel_state import in_the_same_node_as
 
-        assigned_physical_gpu_ids = get_assigned_physical_gpu_ids()
-        if assigned_physical_gpu_ids is not None:
-            local_size = len(assigned_physical_gpu_ids)
-        else:
-            local_size = current_platform.device_count()
         rank = dist.get_rank()
-        same_node = rank // local_size == reader_rank // local_size
+        reader_group_rank = dist.get_group_rank(pg, reader_rank)
+        same_node = in_the_same_node_as(pg, source_rank=reader_group_rank)[
+            dist.get_rank(pg)
+        ]
         buffer_io = MessageQueue(
             n_reader=1,
             n_local_reader=1 if same_node else 0,

@@ -511,6 +511,7 @@ class EngineArgs:
     master_addr: str = ParallelConfig.master_addr
     master_port: int = ParallelConfig.master_port
     nnodes: int = ParallelConfig.nnodes
+    plait_tp_layout: tuple[int, ...] | None = ParallelConfig.plait_tp_layout
     node_rank: int = ParallelConfig.node_rank
     distributed_timeout_seconds: int | None = ParallelConfig.distributed_timeout_seconds
     cpu_distributed_timeout_seconds: int | None = (
@@ -1118,6 +1119,9 @@ class EngineArgs:
         parallel_group.add_argument("--master-port", **parallel_kwargs["master_port"])
         parallel_group.add_argument("--nnodes", "-n", **parallel_kwargs["nnodes"])
         parallel_group.add_argument("--node-rank", "-r", **parallel_kwargs["node_rank"])
+        parallel_group.add_argument(
+            "--plait-tp-layout", **parallel_kwargs["plait_tp_layout"]
+        )
         parallel_group.add_argument(
             "--distributed-timeout-seconds",
             **parallel_kwargs["distributed_timeout_seconds"],
@@ -2290,7 +2294,7 @@ class EngineArgs:
                 "Use the MP backend or set `--nnodes 1`."
             )
         inferred_data_parallel_rank = 0
-        if self.nnodes > 1:
+        if self.nnodes > 1 and self.plait_tp_layout is None:
             world_size_within_dp = (
                 self.pipeline_parallel_size
                 * self.tensor_parallel_size
@@ -2472,6 +2476,7 @@ class EngineArgs:
             master_port=self.master_port,
             nnodes=self.nnodes,
             node_rank=self.node_rank,
+            plait_tp_layout=self.plait_tp_layout,
             distributed_timeout_seconds=self.distributed_timeout_seconds,
             cpu_distributed_timeout_seconds=self.cpu_distributed_timeout_seconds,
             data_parallel_master_ip=data_parallel_address,
