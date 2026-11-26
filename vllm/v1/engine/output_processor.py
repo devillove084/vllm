@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, cast
 import numpy as np
 import torch
 
+from vllm.exceptions import VLLMValidationError
 from vllm.lora.request import LoRARequest
 from vllm.outputs import (
     STREAM_FINISHED,
@@ -193,6 +194,7 @@ class RequestState:
         # Stream Interval
         self.stream_interval = stream_interval
         self.sent_tokens_offset = 0  # Offset of sent tokens
+        self.has_plait_checkpoint = False
 
         # Streaming input queue
         self.streaming_input = stream_input
@@ -272,7 +274,7 @@ class RequestState:
             output_kind = request.pooling_params.output_kind
 
         assert request.external_req_id is not None
-        return cls(
+        state = cls(
             request_id=request.request_id,
             external_req_id=request.external_req_id,
             parent_req=parent_req,
@@ -295,6 +297,14 @@ class RequestState:
             stream_input=request.resumable,
             remote_prefill_cached_tokens=remote_prefill_cached_tokens,
         )
+        if request.plait_resume_token_ids:
+            assert detokenizer is not None
+            if detokenizer.update(
+                request.plait_resume_token_ids, stop_terminated=False
+            ):
+                raise VLLMValidationError("Plait token checkpoint has already stopped")
+            state.has_plait_checkpoint = True
+        return state
 
     def make_request_output(
         self,
@@ -312,7 +322,7 @@ class RequestState:
             # Only the final output is required in FINAL_ONLY mode.
             return None
 
-        if self.stream_interval > 1:
+        if self.stream_interval > 1 or self.has_plait_checkpoint:
             assert self.detokenizer is not None
 
             # Send output request only when
@@ -334,6 +344,7 @@ class RequestState:
                     self.sent_tokens_offset :
                 ]
                 self.sent_tokens_offset = self.detokenizer.num_output_tokens()
+            self.has_plait_checkpoint = False
 
         external_req_id = self.external_req_id
 

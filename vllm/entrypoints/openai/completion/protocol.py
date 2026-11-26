@@ -675,6 +675,7 @@ class CompletionResponseStreamChoice(OpenAIBaseModel):
     # prompt tokens is put into choice to align with CompletionResponseChoice
     prompt_token_ids: list[int] | None = None
     token_ids: list[int] | None = None
+    plait_resumed_tokens: int | None = None
 
 
 class CompletionStreamResponse(OpenAIBaseModel):

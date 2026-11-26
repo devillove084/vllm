@@ -246,7 +246,7 @@ class Request:
         request: EngineCoreRequest,
         block_hasher: Callable[["Request"], list["BlockHash"]] | None,
     ) -> "Request":
-        return cls(
+        result = cls(
             request_id=request.request_id,
             client_index=request.client_index,
             prompt_token_ids=request.prompt_token_ids,
@@ -268,6 +268,9 @@ class Request:
             reasoning_parser_kwargs=request.reasoning_parser_kwargs,
             abort_immediately=request.abort_immediately,
         )
+        if request.plait_resume_token_ids:
+            result.append_output_token_ids(request.plait_resume_token_ids)
+        return result
 
     def append_output_token_ids(
         self,

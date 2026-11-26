@@ -295,6 +295,9 @@ class OpenAIServingCompletion(GenerateBaseServing):
         num_prompt_tokens = [0] * num_prompts
         num_cached_tokens = None
         first_iteration = True
+        plait_resume_token_ids = (request.kv_transfer_params or {}).get(
+            "plait_resume_token_ids"
+        )
 
         stream_options = request.stream_options
         include_usage, include_continuous_usage = should_include_usage(
@@ -418,6 +421,13 @@ class OpenAIServingCompletion(GenerateBaseServing):
                             )
                         ],
                     )
+                    if (
+                        prompt_token_ids_to_return is not None
+                        and plait_resume_token_ids
+                    ):
+                        chunk.choices[0].plait_resumed_tokens = len(
+                            plait_resume_token_ids
+                        )
                     # Stamp on terminal chunk only when no trailing usage chunk
                     # will follow (that one is the true final message).
                     if (

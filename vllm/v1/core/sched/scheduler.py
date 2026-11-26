@@ -1032,11 +1032,18 @@ class Scheduler(SchedulerInterface):
 
                     # Track first scheduled prefill, not post-preemption repeat prefills
                     if request.prefill_stats and request.num_preemptions <= 0:
-                        assert num_computed_tokens <= request.num_prompt_tokens
+                        # A resume can load pages containing already emitted
+                        # decode tokens. Prompt usage excludes those tokens.
+                        prompt_local_hits = min(
+                            num_new_local_computed_tokens, request.num_prompt_tokens
+                        )
                         request.prefill_stats.set(
                             num_prompt_tokens=request.num_prompt_tokens,
-                            num_local_cached_tokens=num_new_local_computed_tokens,
-                            num_external_cached_tokens=num_external_computed_tokens,
+                            num_local_cached_tokens=prompt_local_hits,
+                            num_external_cached_tokens=min(
+                                num_external_computed_tokens,
+                                request.num_prompt_tokens - prompt_local_hits,
+                            ),
                         )
                 else:
                     # KVTransfer: WAITING reqs have num_computed_tokens > 0

@@ -25,7 +25,7 @@ from vllm.platforms import current_platform
 from vllm.pooling_params import PoolingParams
 from vllm.renderers import BaseRenderer, renderer_from_config
 from vllm.renderers.inputs.preprocess import parse_model_prompt
-from vllm.sampling_params import SamplingParams
+from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.tasks import GENERATION_TASKS, POOLING_TASKS, SupportedTask
 from vllm.tokenizers import TokenizerLike
 from vllm.utils import length_from_prompt_token_ids_or_embeds, random_uuid
@@ -411,6 +411,7 @@ class InputProcessor:
 
         sampling_params = None
         pooling_params = None
+        plait_resume_token_ids = None
         if isinstance(params, SamplingParams):
             # TODO: can we avoid cloning here in multiproc case?
             sampling_params = params.clone()
@@ -445,6 +446,15 @@ class InputProcessor:
                 sampling_params.update_from_tokenizer(self.tokenizer)
             if sampling_params.trace_decode_token_ids:
                 self._normalize_trace_replay_params(sampling_params, prompt_len)
+            kv_params = (sampling_params.extra_args or {}).get("kv_transfer_params")
+            if isinstance(kv_params, dict) and "plait_resume_token_ids" in kv_params:
+                if decoder_input["type"] != "token" or lora_request or resumable:
+                    raise VLLMValidationError(
+                        "Plait resume requires a plain token prompt"
+                    )
+                plait_resume_token_ids = self._validate_plait_resume(
+                    kv_params["plait_resume_token_ids"], sampling_params, prompt_len
+                )
         else:
             pooling_params = params.clone()
 
@@ -503,7 +513,50 @@ class InputProcessor:
             resumable=resumable,
             session_id=session_id,
             kv_hints=kv_hints,
+            plait_resume_token_ids=plait_resume_token_ids,
         )
+
+    def _validate_plait_resume(
+        self, tokens: object, params: SamplingParams, prompt_len: int
+    ) -> list[int]:
+        config = self.vllm_config
+        transfer = config.kv_transfer_config
+        if (
+            transfer is None
+            or transfer.kv_connector != "PlaitKvConnector"
+            or not transfer.is_kv_consumer
+            or not config.use_v2_model_runner
+            or config.speculative_config is not None
+        ):
+            raise VLLMValidationError("Plait resume requires a V2 Plait KV consumer")
+        if (
+            params.n != 1
+            or params.temperature != 0
+            or params.output_kind != RequestOutputKind.DELTA
+            or params.logprobs is not None
+            or params.logprob_token_ids is not None
+            or params.prompt_logprobs is not None
+            or params.prompt_logprob_token_ids is not None
+            or params.structured_outputs is not None
+            or params.repetition_detection is not None
+            or params.thinking_token_budget is not None
+            or params.trace_decode_token_ids is not None
+        ):
+            raise VLLMValidationError("Plait resume requires one plain greedy stream")
+        vocab_size = self.model_config.get_vocab_size()
+        if (
+            not isinstance(tokens, list)
+            or not tokens
+            or params.max_tokens is None
+            or len(tokens) >= params.max_tokens
+            or prompt_len + len(tokens) >= self.model_config.max_model_len
+            or any(
+                type(token) is not int or not 0 <= token < vocab_size
+                for token in tokens
+            )
+        ):
+            raise VLLMValidationError("invalid Plait token checkpoint")
+        return tokens
 
     def _validate_prompt_len(
         self,

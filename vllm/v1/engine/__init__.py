@@ -159,6 +159,7 @@ class EngineCoreRequest(
 
     session_id: str | None = None
     kv_hints: KvHintsEnvelope | None = None
+    plait_resume_token_ids: list[int] | None = None
 
     @property
     def params(self) -> SamplingParams | PoolingParams:

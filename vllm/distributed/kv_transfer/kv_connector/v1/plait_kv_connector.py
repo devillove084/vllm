@@ -174,7 +174,7 @@ class PlaitKvConnector(KVConnectorBase_V1):
             ]
         ).encode()
         self.session = uuid.uuid4().bytes
-        self.requests: dict[str, Request] = {}
+        self.requests: dict[str, tuple[Request, int]] = {}
         self.found: dict[str, tuple[int, list[bytes]]] = {}
         self.loads: list[Block] = []
         self.invalid_blocks: set[int] = set()
@@ -232,7 +232,7 @@ class PlaitKvConnector(KVConnectorBase_V1):
         num_external_tokens: int,
     ) -> None:
         if self._kv_transfer_config.is_kv_producer and self._eligible(request):
-            self.requests[request.request_id] = request
+            self.requests.setdefault(request.request_id, (request, 0))
         match = self.found.pop(request.request_id, None)
         if num_external_tokens:
             assert match is not None
@@ -254,13 +254,15 @@ class PlaitKvConnector(KVConnectorBase_V1):
         block_state = scheduler_output.kv_connector_block_state
         assert block_state is not None
         for req_id, scheduled in scheduler_output.num_scheduled_tokens.items():
-            request = self.requests.get(req_id)
-            if request is None:
+            tracked = self.requests.get(req_id)
+            if tracked is None:
                 continue
-            before = request.num_computed_tokens
-            first = before // self.block_size
+            request, first = tracked
+            # Async scheduling can schedule a page boundary before the token IDs
+            # are available. Revisit pages once both the IDs and work are staged.
             count = (
-                min(before + scheduled, len(request.all_token_ids)) // self.block_size
+                min(request.num_computed_tokens + scheduled, len(request.all_token_ids))
+                // self.block_size
             )
             if count <= first:
                 continue
@@ -275,6 +277,7 @@ class PlaitKvConnector(KVConnectorBase_V1):
                     strict=True,
                 )
             )
+            self.requests[req_id] = (request, count)
         return metadata
 
     def request_finished(
