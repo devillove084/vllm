@@ -157,6 +157,12 @@ KVConnectorFactory.register_connector(
 )
 
 KVConnectorFactory.register_connector(
+    "PlaitKvConnector",
+    "vllm.distributed.kv_transfer.kv_connector.v1.plait_kv_connector",
+    "PlaitKvConnector",
+)
+
+KVConnectorFactory.register_connector(
     "ExampleHiddenStatesConnector",
     "vllm.distributed.kv_transfer.kv_connector.v1.example_hidden_states_connector",
     "ExampleHiddenStatesConnector",
