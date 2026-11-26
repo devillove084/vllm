@@ -138,6 +138,34 @@ vllm serve /path/to/the/model/in/the/container \
 
 ### Running vLLM with MultiProcessing
 
+#### Plait tensor and pipeline parallelism
+
+The Plait runtime fork supports eager execution with the `mp` executor.
+Install the Plait device runtime on each host and set `VLLM_USE_PLAIT=1`.
+For multi-host PP, pass the same `--plait-tp-layout` on every host in
+node-rank order. Its worker counts add up to TP times PP. The worker order
+assigns consecutive sets of TP workers to successive pipeline stages.
+
+```bash
+VLLM_USE_PLAIT=1 vllm serve "$MODEL" --enforce-eager \
+    --distributed-executor-backend mp --nnodes 2 --node-rank "$NODE_RANK" \
+    --master-addr "$MASTER_ADDR" --master-port "$MASTER_PORT" \
+    --tensor-parallel-size 2 --pipeline-parallel-size 2 --plait-tp-layout 2 2
+```
+
+Run this command on both hosts and add `--headless` on node rank 1.
+Each host uses its local model path and device mask. Set
+`VLLM_PP_LAYER_PARTITION` to the same comma-separated layer counts on every
+host to override the model's default layer split. The counts sum to the
+model's number of hidden layers. The hosts compare the worker counts,
+parallel sizes, and layer partition before starting workers.
+
+Plait carries TP collectives and pipeline device tensors. Gloo carries
+pipeline metadata. The receiving stage allocates device tensors on its
+own accelerator. Use DP, PCP and DCP sizes of one and leave EP disabled.
+
+#### Standard multiprocessing deployment
+
 Besides Ray, Multi-node vLLM deployments can also use `multiprocessing` as the runtime engine. Here's an example to deploy model across 2 nodes (8 GPUs per node) with `tp_size=8` and `pp_size=2`.
 
 Choose one node as the head node and run:

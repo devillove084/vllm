@@ -27,17 +27,21 @@ MODEL = "facebook/opt-125m"
 
 
 @pytest.mark.parametrize(
-    "layout,nnodes,expected",
+    "tp,pp,layout,nnodes,expected",
     [
-        ((2, 1, 1), 3, [[0, 1], [2], [3]]),
-        (None, 2, [[0, 1], [2, 3]]),
+        (4, 1, (2, 1, 1), 3, [[0, 1], [2], [3]]),
+        (4, 1, None, 2, [[0, 1], [2, 3]]),
+        (2, 2, (1, 3), 2, [[0], [1, 2, 3]]),
     ],
 )
-def test_multiproc_executor_host_rank_ranges(monkeypatch, layout, nnodes, expected):
+def test_multiproc_executor_host_rank_ranges(
+    monkeypatch, tp, pp, layout, nnodes, expected
+):
     monkeypatch.setenv("VLLM_USE_PLAIT", "1")
     for node_rank, ranks in enumerate(expected):
         config = ParallelConfig(
-            tensor_parallel_size=4,
+            tensor_parallel_size=tp,
+            pipeline_parallel_size=pp,
             distributed_executor_backend="mp",
             nnodes=nnodes,
             node_rank=node_rank,
@@ -45,7 +49,7 @@ def test_multiproc_executor_host_rank_ranges(monkeypatch, layout, nnodes, expect
         )
         executor = object.__new__(MultiprocExecutor)
         executor.parallel_config = config
-        assert executor._get_parallel_sizes() == (4, 1, 1)
+        assert executor._get_parallel_sizes() == (tp, pp, 1)
         assert executor.local_world_size == len(ranks)
         assert list(config.local_worker_ranks) == ranks
 
@@ -62,21 +66,29 @@ def test_plait_layout_rejects_invalid_worker_counts(monkeypatch, layout):
         )
 
 
-def test_plait_layout_rejects_conflicting_host_placements(monkeypatch):
+@pytest.mark.parametrize(
+    "topologies",
+    [
+        [(4, 1, (2, 1, 1)), (4, 1, (2, 1, 1)), (4, 1, (1, 1, 2))],
+        [(2, 2, (1, 3)), (1, 4, (1, 3))],
+    ],
+)
+def test_plait_layout_rejects_conflicting_host_placements(monkeypatch, topologies):
     monkeypatch.setenv("VLLM_USE_PLAIT", "1")
     port = get_open_port()
     configs = [
         ParallelConfig(
-            tensor_parallel_size=4,
+            tensor_parallel_size=tp,
+            pipeline_parallel_size=pp,
             distributed_executor_backend="mp",
-            nnodes=3,
+            nnodes=len(topologies),
             node_rank=rank,
             master_addr="127.0.0.1",
             master_port=port,
             cpu_distributed_timeout_seconds=10,
             plait_tp_layout=layout,
         )
-        for rank, layout in enumerate(((2, 1, 1), (2, 1, 1), (1, 1, 2)))
+        for rank, (tp, pp, layout) in enumerate(topologies)
     ]
     with ThreadPoolExecutor(max_workers=3) as pool:
         attempts = [pool.submit(agree_on_plait_layout, config) for config in configs]

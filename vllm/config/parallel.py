@@ -297,10 +297,10 @@ class ParallelConfig:
     """num of nodes for multi-node distributed
     inference when distributed_executor_backend is mp."""
     plait_tp_layout: tuple[int, ...] | None = None
-    """Local TP worker counts in node-rank order for a multi-node Plait group.
+    """Local worker counts in node-rank order for multi-node Plait TP or PP.
 
     Supply one positive count per node on every host. The counts must sum to
-    tensor_parallel_size.
+    tensor_parallel_size times pipeline_parallel_size.
     """
     numa_bind: bool = False
     """Enable NUMA binding for GPU worker subprocesses.
@@ -1098,6 +1098,11 @@ class ParallelConfig:
         from vllm.v1.executor import Executor
 
         layout = self.plait_tp_layout
+        if envs.VLLM_USE_PLAIT and self.pipeline_parallel_size > 1:
+            if self.distributed_executor_backend != "mp":
+                raise ValueError("Plait pipeline parallelism requires the mp executor")
+            if self.nnodes > 1 and layout is None:
+                raise ValueError("Multi-node Plait PP requires --plait-tp-layout")
         if layout is not None:
             if (
                 not envs.VLLM_USE_PLAIT
@@ -1105,21 +1110,22 @@ class ParallelConfig:
                 or self.distributed_executor_backend != "mp"
                 or self.data_parallel_size != 1
                 or self.data_parallel_size_local != 1
-                or self.pipeline_parallel_size != 1
                 or self.prefill_context_parallel_size != 1
             ):
                 raise ValueError(
                     "--plait-tp-layout requires VLLM_USE_PLAIT=1, the multi-node "
-                    "mp executor, and a single TP group (DP, PP and PCP sizes of 1)"
+                    "mp executor, and DP and PCP sizes of 1"
                 )
             if (
                 len(layout) != self.nnodes
                 or any(count < 1 for count in layout)
-                or sum(layout) != self.tensor_parallel_size
+                or sum(layout)
+                != self.tensor_parallel_size * self.pipeline_parallel_size
             ):
                 raise ValueError(
                     "--plait-tp-layout requires one positive worker count per "
-                    "node, summing to --tensor-parallel-size"
+                    "node, summing to --tensor-parallel-size times "
+                    "--pipeline-parallel-size"
                 )
             if self.node_rank >= self.nnodes:
                 raise ValueError("--node-rank must be less than --nnodes")

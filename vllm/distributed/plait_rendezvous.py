@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
 from datetime import timedelta
 from typing import TYPE_CHECKING
 
 from torch.distributed import DistStoreError, PrefixStore, TCPStore
 from torch.distributed.constants import default_pg_timeout
 
+from vllm import envs
 from vllm.distributed.utils import create_tcp_store
 
 if TYPE_CHECKING:
@@ -42,6 +44,15 @@ def agree_on_plait_layout(config: "ParallelConfig") -> TCPStore:
         raise ValueError(f"Duplicate node rank {config.node_rank} in Plait TP layout")
 
     layout = ",".join(str(count) for count in config.plait_tp_layout).encode()
+    if config.pipeline_parallel_size > 1:
+        layout = json.dumps(
+            {
+                "workers": config.plait_tp_layout,
+                "tp": config.tensor_parallel_size,
+                "pp": config.pipeline_parallel_size,
+                "layers": envs.VLLM_PP_LAYER_PARTITION,
+            }
+        ).encode()
     store.set(key, layout)
     try:
         store.wait(keys)
@@ -53,7 +64,7 @@ def agree_on_plait_layout(config: "ParallelConfig") -> TCPStore:
     observed = [store.get(key) for key in keys]
     if any(other != layout for other in observed):
         raise ValueError(
-            "Inconsistent --plait-tp-layout across hosts (node-rank order): "
+            "Inconsistent --plait-tp-layout, TP/PP sizes or layer partition: "
             + ", ".join(plan.decode() for plan in observed)
         )
     return launch_store

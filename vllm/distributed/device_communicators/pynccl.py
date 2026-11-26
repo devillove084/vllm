@@ -183,7 +183,7 @@ class PyNcclCommunicator:
             ):
                 raise ValueError("Plait peer startup requires a Gloo process group")
             self._init_comm(device, peer_group=group)
-            logger.info_once("vLLM TP collectives are using Plait peer transport")
+            logger.info_once("vLLM device communication is using Plait peer transport")
             return
 
         if self.rank == 0:

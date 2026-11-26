@@ -61,6 +61,9 @@ from vllm.utils.torch_utils import (
 )
 
 if TYPE_CHECKING:
+    from vllm.distributed.device_communicators.plait_communicator import (
+        PlaitCommunicator,
+    )
     from vllm.distributed.stateless_coordinator import StatelessGroupCoordinator
 
 
@@ -448,6 +451,7 @@ class GroupCoordinator:
     device_group: ProcessGroup  # group for device communication
     # device communicator (if use_device_communicator=True)
     device_communicator: DeviceCommunicatorBase | None
+    _plait_pipeline: "PlaitCommunicator | None" = None
     mq_broadcaster: Any | None  # shared memory broadcaster
 
     def __init__(
@@ -1143,6 +1147,10 @@ class GroupCoordinator:
             handles, _ = pending[0]
             tensor_handles = handles[1:]
             if not tensor_handles:
+                if self._plait_pipeline is not None:
+                    # Plait already staged the device tensors, but metadata still
+                    # owns asynchronous Gloo work and its source buffers.
+                    handles[0].wait()
                 pending.popleft()
                 continue
             if not all(h.is_completed() for h in tensor_handles):
@@ -1213,14 +1221,17 @@ class GroupCoordinator:
             ):
                 tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
 
-            comm_group = metadata_group if tensor.is_cpu else group
-            handle = torch.distributed.isend(
-                tensor, dst=self.ranks[dst], group=comm_group
-            )
-            if tensor.is_cuda:
-                tensor.record_stream(torch.cuda.current_stream(tensor.device))
-            handles.append(handle)
-            sent_tensors.append(tensor)
+            if self._plait_pipeline is not None and not tensor.is_cpu:
+                self._plait_pipeline.send(tensor, dst)
+            else:
+                comm_group = metadata_group if tensor.is_cpu else group
+                handle = torch.distributed.isend(
+                    tensor, dst=self.ranks[dst], group=comm_group
+                )
+                if tensor.is_cuda:
+                    tensor.record_stream(torch.cuda.current_stream(tensor.device))
+                handles.append(handle)
+                sent_tensors.append(tensor)
 
         # Self-retain for fire-and-forget callers: keep the handles and
         # the source tensors alive until the sends complete (reaped
@@ -1315,30 +1326,38 @@ class GroupCoordinator:
 
         for key, value in recv_metadata_list:
             if isinstance(value, TensorMetadata):
-                full_tensor = torch.empty(
-                    value.size, dtype=value.dtype, device=value.device
-                )
+                device = value.device
+                if self._plait_pipeline is not None and device != "cpu":
+                    # The sending stage can run on another device backend.
+                    device = self._plait_pipeline.device
+                full_tensor = torch.empty(value.size, dtype=value.dtype, device=device)
                 if full_tensor.numel() == 0:
                     tensor_dict[key] = full_tensor
                     continue
 
-                if self._should_use_all_gather(
+                use_all_gather = self._should_use_all_gather(
                     key, full_tensor.numel(), all_gather_group, all_gather_tensors
-                ):
-                    orig_shape = full_tensor.shape
-                    slice_tensor = full_tensor.reshape(all_gather_size, -1)[
-                        all_gather_rank
-                    ]
-                    comm_group = metadata_group if slice_tensor.is_cpu else group
+                )
+                tensor = full_tensor
+                if use_all_gather:
+                    tensor = full_tensor.reshape(all_gather_size, -1)[all_gather_rank]
+
+                if self._plait_pipeline is not None and not tensor.is_cpu:
+                    self._plait_pipeline.recv_into(tensor, src)
+                else:
+                    comm_group = metadata_group if tensor.is_cpu else group
                     handle = torch.distributed.irecv(
-                        slice_tensor, src=self.ranks[src], group=comm_group
+                        tensor, src=self.ranks[src], group=comm_group
                     )
                     handles.append(handle)
+                tensor_dict[key] = tensor
+
+                if use_all_gather:
 
                     def _postprocess(
                         key: str = key,
-                        slice_tensor: torch.Tensor = slice_tensor,
-                        orig_shape: tuple[int, ...] = tuple(orig_shape),
+                        slice_tensor: torch.Tensor = tensor,
+                        orig_shape: tuple[int, ...] = tuple(full_tensor.shape),
                         all_gather_group=all_gather_group,
                     ) -> None:
                         assert all_gather_group is not None
@@ -1347,14 +1366,6 @@ class GroupCoordinator:
                         ).reshape(orig_shape)
 
                     postprocess.append(_postprocess)
-                    tensor_dict[key] = slice_tensor
-                else:
-                    comm_group = metadata_group if full_tensor.is_cpu else group
-                    handle = torch.distributed.irecv(
-                        full_tensor, src=self.ranks[src], group=comm_group
-                    )
-                    handles.append(handle)
-                    tensor_dict[key] = full_tensor
             else:
                 tensor_dict[key] = value
 
@@ -1392,6 +1403,7 @@ class GroupCoordinator:
         if self.device_communicator is not None:
             self.device_communicator.destroy()
             self.device_communicator = None
+            self._plait_pipeline = None
         # A device runtime may shut down the default process group before
         # the engine finalizer runs. That also destroys its subgroups.
         groups_initialized = torch.distributed.is_initialized()
@@ -1493,7 +1505,9 @@ def init_model_parallel_group(
     use_device_communicator: bool = True,
     use_all2all: bool = False,
 ) -> GroupCoordinator:
-    use_plait = envs.VLLM_USE_PLAIT and group_name == "tp" and use_device_communicator
+    use_plait = (
+        envs.VLLM_USE_PLAIT and group_name in ("tp", "pp") and use_device_communicator
+    )
     group = GroupCoordinator(
         group_ranks=group_ranks,
         local_rank=local_rank,
@@ -1513,9 +1527,10 @@ def init_model_parallel_group(
         if isinstance(device, int):
             device = torch.device(current_platform.device_type, device)
         try:
-            group.device_communicator = PlaitCommunicator(
-                group.cpu_group, device, group.unique_name
-            )
+            communicator = PlaitCommunicator(group.cpu_group, device, group.unique_name)
+            group.device_communicator = communicator
+            if group_name == "pp":
+                group._plait_pipeline = communicator
         except Exception:
             group.destroy()
             raise
@@ -2097,16 +2112,19 @@ def initialize_model_parallel(
         )
 
     if envs.VLLM_USE_PLAIT:
-        # The compatibility rendezvous currently has one address per job.
         if (
-            world_size != tensor_model_parallel_size
-            or pipeline_model_parallel_size != 1
+            world_size != tensor_model_parallel_size * pipeline_model_parallel_size
             or prefill_context_model_parallel_size != 1
             or decode_context_model_parallel_size not in (None, 1)
             or data_parallel_size != 1
             or parallel_config.enable_expert_parallel
         ):
-            raise ValueError("Plait currently requires one tensor-parallel group")
+            raise ValueError("Plait requires TP or PP x TP with DP, DCP and PCP of 1")
+        if (
+            pipeline_model_parallel_size > 1
+            and parallel_config.distributed_executor_backend != "mp"
+        ):
+            raise ValueError("Plait pipeline parallelism requires the mp executor")
         backend = "gloo"
 
     # the layout order is: ExternalDP x DP x PP x PCP x TP

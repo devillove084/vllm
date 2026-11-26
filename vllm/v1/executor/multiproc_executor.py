@@ -180,7 +180,7 @@ class MultiprocExecutor(Executor):
             if self.parallel_config.plait_tp_layout is not None:
                 self._plait_store = agree_on_plait_layout(self.parallel_config)
                 logger.info(
-                    "Plait TP layout %s: node_rank=%d, local worker ranks=%s",
+                    "Plait worker layout %s: node_rank=%d, local worker ranks=%s",
                     self.parallel_config.plait_tp_layout,
                     self.parallel_config.node_rank,
                     local_ranks,

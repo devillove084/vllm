@@ -11,7 +11,7 @@ from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
 
 
 class PlaitCommunicator(DeviceCommunicatorBase):
-    """Use the same tensor collectives for every platform in a Plait TP group."""
+    """Use Plait peer transport for device tensors across platforms."""
 
     def __init__(
         self,
@@ -22,7 +22,7 @@ class PlaitCommunicator(DeviceCommunicatorBase):
         super().__init__(cpu_group, device, unique_name=unique_name)
         self.pynccl_comm = PyNcclCommunicator(cpu_group, device, use_peer_group=True)
         if self.pynccl_comm.disabled:
-            raise RuntimeError("Plait TP communicator is disabled")
+            raise RuntimeError(f"Plait communicator {unique_name} is disabled")
 
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
         return self.pynccl_comm.all_reduce(input_.contiguous())
@@ -66,8 +66,11 @@ class PlaitCommunicator(DeviceCommunicatorBase):
         if src is None:
             src = (self.rank_in_group - 1) % self.world_size
         result = torch.empty(size, dtype=dtype, device=self.device)
-        self.pynccl_comm.recv(result, src)
+        self.recv_into(result, src)
         return result
+
+    def recv_into(self, tensor: torch.Tensor, src: int) -> None:
+        self.pynccl_comm.recv(tensor, src)
 
     def destroy(self) -> None:
         self.pynccl_comm.destroy()
