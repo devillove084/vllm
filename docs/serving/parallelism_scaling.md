@@ -171,6 +171,14 @@ For vLLM Ascend 0.31.0rc1, apply the fork's
 The patch checks each stage's own MC2 and TP ranks before reusing the
 Plait TP group.
 
+For disaggregated prefill, use `PlaitKvConnector` on both engines and a
+Plait KV store that supports `PLAITKV3` range requests. The two engines
+share a model namespace, logical KV block size and KV dtype. Each engine
+can choose its own layer partition and TP degree. Pipeline workers transfer
+the blocks for their global layer and head ranges. The store makes a page
+visible once one write attempt has supplied every range. Published pages
+are also readable by the existing `PLAITKV2` whole-head clients.
+
 #### Standard multiprocessing deployment
 
 Besides Ray, Multi-node vLLM deployments can also use `multiprocessing` as the runtime engine. Here's an example to deploy model across 2 nodes (8 GPUs per node) with `tp_size=8` and `pp_size=2`.

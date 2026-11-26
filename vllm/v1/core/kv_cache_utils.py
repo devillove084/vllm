@@ -2828,7 +2828,16 @@ def get_kv_cache_configs(
             vllm_config, groups, min_num_blocks * _pool_bytes_per_block(groups)
         )
 
+    transfer = vllm_config.kv_transfer_config
+    plait_layer_names = (
+        tuple(sorted(global_kv_cache_groups[0].layer_names))
+        if transfer is not None
+        and transfer.kv_connector == "PlaitKvConnector"
+        and len(global_kv_cache_groups) == 1
+        else None
+    )
     for kv_cache_config in kv_cache_configs:
+        kv_cache_config.plait_layer_names = plait_layer_names
         kv_cache_config.kv_tp_replicas = kv_cache_groups_tp_replicas(
             kv_cache_config.kv_cache_groups,
             vllm_config.parallel_config.tensor_parallel_size,

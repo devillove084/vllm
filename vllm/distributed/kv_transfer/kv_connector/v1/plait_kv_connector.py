@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Reuse and hand off full-attention KV across Plait TP placements."""
+"""Reuse and hand off full-attention KV across Plait TP and PP placements."""
 
 from __future__ import annotations
 
@@ -38,15 +38,50 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 _HEADER = struct.Struct("<8sc32s16sIIII")
+_RANGE = struct.Struct("<II")
 _OK = b"\x01"
 _MISS = b"\x00"
 _MAX_BLOCK_BYTES = 64 << 20
+_MAX_PARTS = 65536
+_MAX_RANGES = 4096
 
 
 @dataclass(frozen=True)
 class Block:
     key: bytes
     block_id: int
+
+
+@dataclass(frozen=True)
+class LayerRanges:
+    part_bytes: int
+    ranges: tuple[tuple[int, int], ...]
+
+    @classmethod
+    def for_worker(
+        cls,
+        global_layers: tuple[str, ...],
+        local_layers: tuple[str, ...],
+        total_heads: int,
+        first_head: int,
+        heads: int,
+        part_bytes: int,
+    ) -> LayerRanges:
+        indices = {name: index for index, name in enumerate(global_layers)}
+        layers = [indices[name] for name in local_layers]
+        ranges: list[tuple[int, int]] = []
+        for head in range(first_head, first_head + heads):
+            for layer in layers:
+                offset = head * len(global_layers) + layer
+                if ranges:
+                    first, count = ranges[-1]
+                    if first + count == offset:
+                        ranges[-1] = (first, count + 1)
+                        continue
+                ranges.append((offset, 1))
+        if total_heads * len(global_layers) > _MAX_PARTS or len(ranges) > _MAX_RANGES:
+            raise ValueError("Plait KV layout exceeds the store range limits")
+        return cls(part_bytes, tuple(ranges))
 
 
 @dataclass
@@ -80,10 +115,33 @@ class Store:
         count: int = 0,
         writer: bytes = bytes(16),
         data: bytes = b"",
+        *,
+        parts: LayerRanges | None = None,
     ) -> bytes | None:
-        header = _HEADER.pack(
-            b"PLAITKV2", verb, key, writer, self.heads, first, count, self.head_bytes
-        )
+        if parts is None:
+            header = _HEADER.pack(
+                b"PLAITKV2",
+                verb,
+                key,
+                writer,
+                self.heads,
+                first,
+                count,
+                self.head_bytes,
+            )
+            size = count * self.head_bytes
+        else:
+            header = _HEADER.pack(
+                b"PLAITKV3",
+                verb,
+                key,
+                writer,
+                self.heads,
+                len(parts.ranges),
+                parts.part_bytes,
+                self.head_bytes,
+            ) + b"".join(_RANGE.pack(*item) for item in parts.ranges)
+            size = sum(count for _, count in parts.ranges) * parts.part_bytes
         with socket.create_connection(self.address, self.timeout) as connection:
             connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             connection.sendall(header)
@@ -95,7 +153,7 @@ class Store:
                     return None
                 if state != _OK:
                     raise OSError("invalid Plait KV store response")
-                expected = count * self.head_bytes if verb == b"G" else 0
+                expected = size if verb == b"G" else 0
                 payload = reply.read(expected)
                 if len(payload) != expected:
                     raise OSError("incomplete Plait KV block")
@@ -123,7 +181,6 @@ class PlaitKvConnector(KVConnectorBase_V1):
         parallel = vllm_config.parallel_config
         if (
             len(groups) != 1
-            or parallel.pipeline_parallel_size != 1
             or parallel.prefill_context_parallel_size != 1
             or parallel.decode_context_parallel_size != 1
             or vllm_config.speculative_config is not None
@@ -147,7 +204,18 @@ class PlaitKvConnector(KVConnectorBase_V1):
             raise ValueError(
                 "Plait KV requires unreplicated, dense FP16 or BF16 attention"
             )
-        self.layers = sorted(groups[0].layer_names)
+        self.layers = tuple(sorted(groups[0].layer_names))
+        global_layers = kv_cache_config.plait_layer_names
+        if global_layers is None:
+            if parallel.pipeline_parallel_size > 1:
+                raise ValueError("Plait pipeline KV requires the global layer order")
+            global_layers = self.layers
+        if (
+            not global_layers
+            or tuple(sorted(set(global_layers))) != global_layers
+            or not set(self.layers).issubset(global_layers)
+        ):
+            raise ValueError("Plait KV has an invalid model layer order")
         self.block_size = spec.block_size
         self.heads = spec.num_kv_heads
         self.content = spec.head_size + spec.head_size_v
@@ -157,18 +225,31 @@ class PlaitKvConnector(KVConnectorBase_V1):
             if role == KVConnectorRole.WORKER
             else 0
         )
-        head_bytes = len(self.layers) * self.block_size * self.content * 2
+        part_bytes = self.block_size * self.content * self.dtype.itemsize
+        head_bytes = len(global_layers) * part_bytes
         if total_heads * head_bytes > _MAX_BLOCK_BYTES:
             raise ValueError("Plait KV block exceeds the store limit")
         timeout = float(extra.get("timeout", 3.0))
         if not 0 < timeout <= 15:
             raise ValueError("invalid Plait KV store timeout")
         self.store = Store(address, total_heads, head_bytes, timeout)
+        self.layer_ranges = (
+            LayerRanges.for_worker(
+                global_layers,
+                self.layers,
+                total_heads,
+                self.first_head,
+                self.heads,
+                part_bytes,
+            )
+            if role == KVConnectorRole.WORKER and self.layers != global_layers
+            else None
+        )
         self.domain = json.dumps(
             [
                 "plait-kv2",
                 namespace,
-                self.layers,
+                global_layers,
                 str(self.dtype),
                 self.block_size,
                 total_heads,
@@ -426,11 +507,19 @@ class PlaitKvConnector(KVConnectorBase_V1):
         return cache[block_id * chunks : (block_id + 1) * chunks]
 
     def start_load_kv(self, forward_context: ForwardContext, **kwargs: Any) -> None:
+        if not self.layers:
+            return
         metadata = self._get_connector_metadata()
         assert isinstance(metadata, PlaitKvMetadata)
         for block in metadata.loads:
             try:
-                data = self.store.exchange(b"G", block.key, self.first_head, self.heads)
+                data = self.store.exchange(
+                    b"G",
+                    block.key,
+                    self.first_head,
+                    self.heads,
+                    parts=self.layer_ranges,
+                )
                 if data is None:
                     raise OSError("Plait KV block is missing")
                 with gpu_sync_allowed():
@@ -468,7 +557,7 @@ class PlaitKvConnector(KVConnectorBase_V1):
     def wait_for_save(self) -> None:
         metadata = self._get_connector_metadata()
         assert isinstance(metadata, PlaitKvMetadata)
-        if self.invalid_blocks:
+        if self.invalid_blocks or not self.layers:
             return
         for writer, block in metadata.saves:
             try:
@@ -484,7 +573,13 @@ class PlaitKvConnector(KVConnectorBase_V1):
                     value = torch.stack(layers, dim=1)
                     data = value.contiguous().view(torch.uint8).numpy().tobytes()
                 self.store.exchange(
-                    b"P", block.key, self.first_head, self.heads, writer, data
+                    b"P",
+                    block.key,
+                    self.first_head,
+                    self.heads,
+                    writer,
+                    data,
+                    parts=self.layer_ranges,
                 )
             except OSError:
                 logger.warning_once("Plait KV store unavailable during publication")

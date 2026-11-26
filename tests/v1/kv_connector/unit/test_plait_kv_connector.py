@@ -5,9 +5,18 @@ from types import SimpleNamespace
 
 from vllm.distributed.kv_transfer.kv_connector.v1.plait_kv_connector import (
     Block,
+    LayerRanges,
     PlaitKvConnector,
 )
 from vllm.v1.request import RequestStatus
+
+
+def test_pipeline_stage_merges_only_adjacent_global_head_and_layer_slots() -> None:
+    layers = ("model.layers.0", "model.layers.1", "model.layers.10", "model.layers.2")
+    local_layers = (layers[0], layers[1], layers[3])
+    ranges = LayerRanges.for_worker(layers, local_layers, 4, 1, 2, 128)
+    assert ranges.part_bytes == 128
+    assert ranges.ranges == ((4, 2), (7, 3), (11, 1))
 
 
 def test_exports_a_page_after_async_tokens_become_known() -> None:

@@ -1497,6 +1497,9 @@ class KVCacheConfig:
     kv_tp_replicas: int = 1
     """Consecutive TP ranks holding identical KV for every layer (1: none)."""
 
+    plait_layer_names: tuple[str, ...] | None = None
+    """Global attention layer order for Plait KV, including other PP stages."""
+
     @cached_property
     def transfer_group_ids(self) -> tuple[int, ...]:
         """IDs of cache groups that participate in external KV transfer."""
