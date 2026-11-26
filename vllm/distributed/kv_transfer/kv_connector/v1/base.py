@@ -517,6 +517,10 @@ class KVConnectorBase_V1(ABC):
         """
         pass
 
+    def take_unavailable_requests(self) -> set[str]:
+        """Take requests whose required external KV cannot be admitted."""
+        return set()
+
     @abstractmethod
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int

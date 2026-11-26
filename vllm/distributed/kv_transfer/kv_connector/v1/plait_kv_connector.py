@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Reuse full-attention KV blocks across Plait tensor-parallel placements."""
+"""Reuse and hand off full-attention KV across Plait TP placements."""
 
 from __future__ import annotations
 
 import hashlib
 import json
+import re
 import socket
 import struct
 import uuid
@@ -24,6 +25,7 @@ from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
 from vllm.logger import init_logger
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVQuantMode
+from vllm.v1.request import RequestStatus
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -176,6 +178,7 @@ class PlaitKvConnector(KVConnectorBase_V1):
         self.session = uuid.uuid4().bytes
         self.requests: dict[str, tuple[Request, int]] = {}
         self.found: dict[str, tuple[int, list[bytes]]] = {}
+        self.unavailable_requests: set[str] = set()
         self.loads: list[Block] = []
         self.invalid_blocks: set[int] = set()
         self.caches: list[tuple[torch.Tensor, torch.Tensor]] = []
@@ -188,11 +191,15 @@ class PlaitKvConnector(KVConnectorBase_V1):
             and request.lora_request is None
         )
 
-    def _keys(self, request: Request, count: int) -> list[bytes]:
+    def _request_digest(self, request: Request):
         digest = hashlib.sha256(self.domain)
         salt = (request.cache_salt or "").encode()
         digest.update(struct.pack("<Q", len(salt)))
         digest.update(salt)
+        return digest
+
+    def _keys(self, request: Request, count: int) -> list[bytes]:
+        digest = self._request_digest(request)
         tokens = request.all_token_ids
         keys = []
         for index in range(count):
@@ -202,17 +209,70 @@ class PlaitKvConnector(KVConnectorBase_V1):
             keys.append(digest.digest())
         return keys
 
+    def _handoff_receipt(self, request: Request, ticket: str) -> dict[str, Any]:
+        tokens = request.prompt_token_ids
+        assert tokens
+        digest = self._request_digest(request)
+        digest.update(struct.pack(f"<{len(tokens)}I", *tokens))
+        pages = (len(tokens) - 1) // self.block_size
+        host, port = self.store.address
+        return {
+            "ticket": ticket,
+            "store": f"[{host}]:{port}" if ":" in host else f"{host}:{port}",
+            "prompt_sha256": digest.hexdigest(),
+            "cached_tokens": pages * self.block_size,
+        }
+
+    @staticmethod
+    def _handoff_ticket(params: Any) -> str | None:
+        ticket = params.get("ticket") if isinstance(params, dict) else None
+        if isinstance(ticket, str) and re.fullmatch("[0-9a-f]{32}", ticket):
+            return ticket
+        return None
+
+    def _reject_handoff(self, request: Request) -> tuple[None, bool]:
+        self.unavailable_requests.add(request.request_id)
+        return None, False
+
+    def take_unavailable_requests(self) -> set[str]:
+        unavailable, self.unavailable_requests = self.unavailable_requests, set()
+        return unavailable
+
     def get_num_new_matched_tokens(
         self,
         request: Request,
         num_computed_tokens: int,
-    ) -> tuple[int, bool]:
+    ) -> tuple[int | None, bool]:
         self.found.pop(request.request_id, None)
-        if not self._kv_transfer_config.is_kv_consumer or not self._eligible(request):
+        if not self._kv_transfer_config.is_kv_consumer:
             return 0, False
+        if request.request_id in self.unavailable_requests:
+            return None, False
+        params = request.kv_transfer_params or {}
+        required = "plait_handoff" in params
+        if not self._eligible(request):
+            return self._reject_handoff(request) if required else (0, False)
+        if required and not request.prompt_token_ids:
+            return self._reject_handoff(request)
         first = num_computed_tokens // self.block_size
-        # Keep one input token for the forward that produces the next logits.
-        count = (len(request.all_token_ids) - 1) // self.block_size
+        if required:
+            receipt = params["plait_handoff"]
+            ticket = self._handoff_ticket(receipt)
+            if (
+                ticket is None
+                or type(receipt.get("cached_tokens")) is not int
+                or receipt != self._handoff_receipt(request, ticket)
+                or self._kv_transfer_config.kv_load_failure_policy != "fail"
+            ):
+                return self._reject_handoff(request)
+            count = receipt["cached_tokens"] // self.block_size
+            if first < count and request.skip_reading_prefix_cache:
+                return self._reject_handoff(request)
+        else:
+            # Keep one input token for the forward that produces the next logits.
+            count = (len(request.all_token_ids) - 1) // self.block_size
+        if count <= first:
+            return 0, False
         hits = []
         try:
             for key in self._keys(request, count)[first:]:
@@ -221,6 +281,8 @@ class PlaitKvConnector(KVConnectorBase_V1):
                 hits.append(key)
         except OSError:
             logger.warning_once("Plait KV store unavailable during prefix lookup")
+        if required and len(hits) != count - first:
+            return self._reject_handoff(request)
         if hits:
             self.found[request.request_id] = (first, hits)
         return len(hits) * self.block_size, False
@@ -287,7 +349,35 @@ class PlaitKvConnector(KVConnectorBase_V1):
     ) -> tuple[bool, dict[str, Any] | None]:
         self.requests.pop(request.request_id, None)
         self.found.pop(request.request_id, None)
-        return False, None
+        params = (request.kv_transfer_params or {}).get("plait_handoff")
+        ticket = self._handoff_ticket(params)
+        if (
+            not self._kv_transfer_config.is_kv_producer
+            or ticket is None
+            or set(params) != {"ticket"}
+            or request.status
+            not in (
+                RequestStatus.FINISHED_STOPPED,
+                RequestStatus.FINISHED_LENGTH_CAPPED,
+            )
+            or not self._eligible(request)
+            or not request.prompt_token_ids
+        ):
+            return False, None
+        receipt = self._handoff_receipt(request, ticket)
+        count = receipt["cached_tokens"] // self.block_size
+        if request.num_computed_tokens < receipt["cached_tokens"]:
+            return False, None
+        try:
+            if any(
+                self.store.exchange(b"H", key) is None
+                for key in self._keys(request, count)
+            ):
+                return False, None
+        except OSError:
+            logger.warning_once("Plait KV store unavailable during handoff publication")
+            return False, None
+        return False, {"plait_handoff": receipt}
 
     def register_kv_caches(
         self,

@@ -2253,6 +2253,8 @@ class Scheduler(SchedulerInterface):
         self.encoder_cache_mismatch_reqs.clear()
         if failed_kv_load_req_ids and not self.recompute_kv_load_failures:
             error_req_ids.update(failed_kv_load_req_ids)
+        if self.connector is not None:
+            error_req_ids.update(self.connector.take_unavailable_requests())
         if self.ec_connector is not None:
             # An encoder input the connector can no longer obtain. Failing is
             # retryable: re-issuing the request re-runs the encode.
