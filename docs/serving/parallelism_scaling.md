@@ -160,9 +160,16 @@ host to override the model's default layer split. The counts sum to the
 model's number of hidden layers. The hosts compare the worker counts,
 parallel sizes, and layer partition before starting workers.
 
-Plait carries TP collectives and pipeline device tensors. Gloo carries
-pipeline metadata. The receiving stage allocates device tensors on its
-own accelerator. Use DP, PCP and DCP sizes of one and leave EP disabled.
+Plait carries TP collectives, pipeline activations and sampled-token
+feedback to earlier stages. Gloo carries pipeline metadata. The receiving
+stage allocates device tensors on its own accelerator. Use DP, PCP and DCP
+sizes of one and leave EP disabled.
+With automatic KV block sizing, every worker contributes its attention
+backend's requirements before the engine allocates the cache.
+For vLLM Ascend 0.31.0rc1, apply the fork's
+`tools/plait/vendor/vllm-ascend-v0.31.0rc1.patch` when building the plugin.
+The patch checks each stage's own MC2 and TP ranks before reusing the
+Plait TP group.
 
 #### Standard multiprocessing deployment
 

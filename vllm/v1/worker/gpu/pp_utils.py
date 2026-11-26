@@ -53,20 +53,20 @@ def compute_need_sampled_mask(input_batch: InputBatch) -> np.ndarray | None:
 
 
 class PPHandler:
-    """Runs the PP sampled-token broadcast/recv on a side stream so the
-    default stream isn't gated by the matching peer call. Step T's recv is
-    consumed at step T+pp_size via `get_prev_sampled_outputs`.
+    """Run PP sampled-token feedback on a side stream.
 
-    Uses a dedicated NCCL communicator (sibling of the PP `device_group`)
-    for the broadcast so it does not serialize on the wire with the
-    inter-stage hidden-state p2p send/recv ops.
+    Step T's receive is consumed at step T+pp_size via
+    `get_prev_sampled_outputs`.
+
+    Uses a dedicated NCCL communicator for native broadcast. Plait broadcasts
+    use the pipeline peers' collective links, separate from activation sends.
     """
 
     def __init__(
         self, max_num_reqs: int, num_speculative_steps: int, device: torch.device
     ):
-        self.is_last_rank = get_pp_group().is_last_rank
-        self.last_rank = get_pp_group().last_rank
+        self.pp_group = get_pp_group()
+        self.is_last_rank = self.pp_group.is_last_rank
         self.max_sample_len = num_speculative_steps + 1
         self.num_speculative_steps = num_speculative_steps
         self.device = device
@@ -78,7 +78,7 @@ class PPHandler:
         # with pp_size None placeholders so the first pp_size consumes are no-ops.
         # None means no postprocess is pending for that step (broadcast skipped).
         # Only XPU can disable microbatching via VLLM_XPU_PP_MICROBATCH.
-        ring_depth = get_pp_group().world_size
+        ring_depth = self.pp_group.world_size
         if current_platform.is_xpu() and not envs.VLLM_XPU_PP_MICROBATCH:
             ring_depth = 1
         self.queue: deque[PendingRecv | None] = (
@@ -90,11 +90,20 @@ class PPHandler:
         # between PP decodes.
         self.req_idx_gen_np = np.zeros(max_num_reqs, dtype=np.int32)
 
-        # Dedicated subgroup for the sampled-token broadcast.
-        self.broadcast_group = get_pp_group().make_sibling_device_group(
-            group_desc="pp_broadcast"
+        self.broadcast_group = (
+            None
+            if envs.VLLM_USE_PLAIT
+            else self.pp_group.make_sibling_device_group(group_desc="pp_broadcast")
         )
         self.aux_hidden_state_relay_keys: tuple[str, ...] = ()
+
+    def _broadcast_from_last_stage(self, tensor: torch.Tensor) -> None:
+        if self.broadcast_group is None:
+            self.pp_group.broadcast(tensor, src=self.pp_group.world_size - 1)
+        else:
+            torch.distributed.broadcast(
+                tensor, src=self.pp_group.last_rank, group=self.broadcast_group
+            )
 
     def on_req_idx_freed(self, req_idx: int) -> None:
         self.req_idx_gen_np[req_idx] += 1
@@ -182,9 +191,7 @@ class PPHandler:
             # Must record the idx_mapping tensor since it was allocated
             # on the main stream.
             input_batch.idx_mapping.record_stream(self.broadcast_stream)
-            torch.distributed.broadcast(
-                send, src=self.last_rank, group=self.broadcast_group
-            )
+            self._broadcast_from_last_stage(send)
 
     def receive(self, input_batch: InputBatch) -> bool:
         """Returns True iff sampled tokens need to be gathered from *all*
@@ -206,12 +213,8 @@ class PPHandler:
                 num_reqs, self.max_sample_len, dtype=torch.int64, device=self.device
             )
             combined = torch.empty(2, num_reqs, dtype=torch.int32, device=self.device)
-            torch.distributed.broadcast(
-                sampled_tokens, src=self.last_rank, group=self.broadcast_group
-            )
-            torch.distributed.broadcast(
-                combined, src=self.last_rank, group=self.broadcast_group
-            )
+            self._broadcast_from_last_stage(sampled_tokens)
+            self._broadcast_from_last_stage(combined)
             draft_tokens = None
             if self.num_speculative_steps > 0:
                 draft_tokens = torch.empty(
@@ -220,9 +223,7 @@ class PPHandler:
                     dtype=torch.int64,
                     device=self.device,
                 )
-                torch.distributed.broadcast(
-                    draft_tokens, src=self.last_rank, group=self.broadcast_group
-                )
+                self._broadcast_from_last_stage(draft_tokens)
             event = self.broadcast_stream.record_event()
             num_sampled, num_rejected = combined.unbind(dim=0)
             # Must record_stream since these were allocated on broadcast stream but
@@ -267,14 +268,8 @@ class PPHandler:
                 sampled_token_ids,
                 (0, self.max_sample_len - sampled_token_ids.shape[-1]),
             )
-            torch.distributed.broadcast(
-                send_tokens.contiguous(),
-                src=self.last_rank,
-                group=self.broadcast_group,
-            )
+            self._broadcast_from_last_stage(send_tokens.contiguous())
             combined = torch.stack((num_sampled, num_rejected), dim=0)
-            torch.distributed.broadcast(
-                combined, src=self.last_rank, group=self.broadcast_group
-            )
+            self._broadcast_from_last_stage(combined)
             for tensor in (sampled_token_ids, num_sampled, num_rejected):
                 tensor.record_stream(self.broadcast_stream)

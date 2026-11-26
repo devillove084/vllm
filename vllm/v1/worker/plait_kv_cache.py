@@ -30,7 +30,7 @@ def negotiate_block_size(
     preferred: int,
     backends: Sequence[type[AttentionBackend]],
 ) -> int:
-    """Agree on the TP group's cache page size before computing cache specs."""
+    """Agree on the serving group's cache page size before computing cache specs."""
     local_sizes = [
         [
             size.base if isinstance(size, MultipleOf) else size
@@ -61,7 +61,7 @@ def negotiate_block_size(
         if is_accepted:
             return size
     raise ValueError(
-        "Plait TP has no common KV cache block size. "
+        "Plait has no common KV cache block size. "
         f"Worker preferences and kernel sizes: {preferences}; "
         f"checked cache sizes: {candidates}"
     )

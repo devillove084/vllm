@@ -105,14 +105,14 @@ class WorkerBase:
         raise NotImplementedError
 
     def negotiate_plait_kv_block_size(self) -> int:
-        """Agree with TP peers using the attention backends loaded on this worker."""
-        from vllm.distributed.parallel_state import get_tp_group
+        """Agree on one KV block size across all workers of the serving group."""
+        from vllm.distributed.parallel_state import get_world_group
         from vllm.v1.worker.plait_kv_cache import negotiate_block_size
 
         with set_current_vllm_config(self.vllm_config):
             backends = get_current_attn_backends(self.vllm_config)
             self.cache_config.block_size = negotiate_block_size(
-                get_tp_group().cpu_group, self.cache_config.block_size, backends
+                get_world_group().cpu_group, self.cache_config.block_size, backends
             )
         return self.cache_config.block_size
 

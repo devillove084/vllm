@@ -837,7 +837,10 @@ class GroupCoordinator:
             return input_
         if (
             envs.VLLM_USE_PLAIT
-            and self.unique_name.split(":")[0] == "tp"
+            and (
+                self._plait_pipeline is not None
+                or self.unique_name.split(":")[0] == "tp"
+            )
             and input_.device.type != "cpu"
         ):
             assert self.device_communicator is not None

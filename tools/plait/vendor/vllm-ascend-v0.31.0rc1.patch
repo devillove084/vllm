@@ -1,5 +1,5 @@
 diff --git a/vllm_ascend/distributed/parallel_state.py b/vllm_ascend/distributed/parallel_state.py
-index 433d7e4..3d24441 100644
+index 433d7e4..9b7be16 100644
 --- a/vllm_ascend/distributed/parallel_state.py
 +++ b/vllm_ascend/distributed/parallel_state.py
 @@ -1,6 +1,7 @@
@@ -17,8 +17,8 @@ index 433d7e4..3d24441 100644
 -    _MC2 = init_model_parallel_group(group_ranks, get_world_group().local_rank, backend, group_name="mc2")
 +    if vllm_envs.VLLM_USE_PLAIT:
 +        tp_group = vllm_parallel_state.get_tp_group()
-+        if group_ranks != [tp_group.ranks]:
-+            raise ValueError("Plait TP requires the Ascend MC2 ranks to match the TP group")
++        if tp_group.ranks not in group_ranks:
++            raise ValueError("Plait requires a stage-local Ascend MC2 group matching TP")
 +        _MC2 = tp_group
 +    else:
 +        _MC2 = init_model_parallel_group(group_ranks, get_world_group().local_rank, backend, group_name="mc2")
