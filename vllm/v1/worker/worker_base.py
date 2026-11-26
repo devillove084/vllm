@@ -104,6 +104,18 @@ class WorkerBase:
         """Get specifications for KV cache implementation."""
         raise NotImplementedError
 
+    def negotiate_plait_kv_block_size(self) -> int:
+        """Agree with TP peers using the attention backends loaded on this worker."""
+        from vllm.distributed.parallel_state import get_tp_group
+        from vllm.v1.worker.plait_kv_cache import negotiate_block_size
+
+        with set_current_vllm_config(self.vllm_config):
+            backends = get_current_attn_backends(self.vllm_config)
+            self.cache_config.block_size = negotiate_block_size(
+                get_tp_group().cpu_group, self.cache_config.block_size, backends
+            )
+        return self.cache_config.block_size
+
     def get_supported_kv_cache_layouts(self) -> list[str]:
         """Layout names every attention backend supports, most preferred first."""
         backends = get_current_attn_backends(self.vllm_config)

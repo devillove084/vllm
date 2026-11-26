@@ -258,6 +258,24 @@ class EngineCore:
         # register all kvcache specs in enginecore process.
         register_all_kvcache_specs(vllm_config)
 
+        if (
+            envs.VLLM_USE_PLAIT
+            and vllm_config.parallel_config.tensor_parallel_size > 1
+            and not vllm_config.cache_config.user_specified_block_size
+            and not vllm_config.model_config.is_hybrid
+            and not vllm_config.model_config.is_attention_free
+        ):
+            block_sizes = self.model_executor.collective_rpc(
+                "negotiate_plait_kv_block_size"
+            )
+            block_size = block_sizes[0]
+            if any(size != block_size for size in block_sizes):
+                raise RuntimeError(
+                    f"Plait TP workers chose different KV sizes: {block_sizes}"
+                )
+            vllm_config.cache_config.block_size = block_size
+            logger.info("Plait TP selected a %d-token KV cache block.", block_size)
+
         # Get all kv cache needed by the model
         kv_cache_specs = self.model_executor.get_kv_cache_specs()
 
