@@ -43,6 +43,8 @@ async def health(raw_request: Request) -> Response:
                 headers["X-Plait-KV-Resume"] = "seeded-v2"
             if transfer.get_from_extra_config("checkpoint_admission", False) is True:
                 headers["X-Plait-KV-Checkpoint-Admission"] = "1"
+            if transfer.get_from_extra_config("checkpoint_peer_budget", False) is True:
+                headers["X-Plait-KV-Checkpoint-Peers"] = "1"
         return Response(status_code=200, headers=headers)
     except EngineDeadError:
         return Response(status_code=503)

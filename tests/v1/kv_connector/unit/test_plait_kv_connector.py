@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from struct import Struct
 from types import SimpleNamespace
 from unittest import TestCase
 
@@ -8,11 +9,29 @@ from vllm.distributed.kv_transfer.kv_connector.v1.plait_kv_connector import (
     Block,
     LayerRanges,
     PlaitKvConnector,
+    PlaitKvPeer,
+    _encode_peer_manifest,
 )
 from vllm.exceptions import VLLMValidationError
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.v1.engine.input_processor import InputProcessor
 from vllm.v1.request import RequestStatus
+
+
+def test_worker_manifest_charges_each_address_once_for_its_full_share() -> None:
+    workers = [
+        PlaitKvPeer("192.0.2.2", 4),
+        PlaitKvPeer("::ffff:192.0.2.2", 4),
+        PlaitKvPeer("192.0.2.3", 12),
+    ]
+    entry = Struct("<16sQ")
+    manifest = _encode_peer_manifest(workers, 20)
+    assert list(entry.iter_unpack(manifest)) == [
+        (bytes(10) + b"\xff\xff\xc0\x00\x02\x02", 8),
+        (bytes(10) + b"\xff\xff\xc0\x00\x02\x03", 12),
+    ]
+    with TestCase().assertRaises(ValueError):
+        _encode_peer_manifest(workers[1:], 20)
 
 
 def test_pipeline_stage_merges_only_adjacent_global_head_and_layer_slots() -> None:
@@ -95,6 +114,7 @@ def test_handoff_checks_all_pages_and_binds_the_prompt_tail() -> None:
     connector = object.__new__(PlaitKvConnector)
     connector.checkpoint_only = False
     connector.checkpoint_admission = False
+    connector.checkpoint_peer_budget = False
     connector.block_size = 4
     connector.domain = b"test-model"
     connector.found = {}

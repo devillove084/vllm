@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import re
 import socket
@@ -20,12 +21,14 @@ import torch
 
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
+    KVConnectorHandshakeMetadata,
     KVConnectorMetadata,
     KVConnectorRole,
 )
 from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
 from vllm.logger import init_logger
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
+from vllm.utils.network_utils import get_ip
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVQuantMode
 from vllm.v1.request import RequestStatus
 
@@ -41,11 +44,43 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 _HEADER = struct.Struct("<8sc32s16sIIII")
 _RANGE = struct.Struct("<II")
+_PEER = struct.Struct("<16sQ")
 _OK = b"\x01"
 _MISS = b"\x00"
 _MAX_BLOCK_BYTES = 64 << 20
 _MAX_PARTS = 65536
 _MAX_RANGES = 4096
+_MAX_PEERS = 128
+
+
+@dataclass(frozen=True)
+class PlaitKvPeer(KVConnectorHandshakeMetadata):
+    address: str
+    bytes_per_page: int
+
+
+def _peer_ip(address: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
+    ip = ipaddress.ip_address(address)
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    if ip.is_unspecified or ip.is_multicast or ip == ipaddress.IPv4Address("255.255.255.255"):
+        raise ValueError("Plait KV requires a unicast address for each worker")
+    return ip
+
+
+def _encode_peer_manifest(workers: list[PlaitKvPeer], page_bytes: int) -> bytes:
+    peers: dict[bytes, int] = {}
+    for worker in workers:
+        address = _peer_ip(worker.address)
+        if type(worker.bytes_per_page) is not int or worker.bytes_per_page <= 0:
+            raise ValueError("invalid Plait KV worker page size")
+        packed = address.packed
+        if address.version == 4:
+            packed = bytes(10) + b"\xff\xff" + packed
+        peers[packed] = peers.get(packed, 0) + worker.bytes_per_page
+    if not 1 <= len(peers) <= _MAX_PEERS or sum(peers.values()) != page_bytes:
+        raise ValueError("Plait KV worker layout does not cover one complete page")
+    return b"".join(_PEER.pack(ip, size) for ip, size in sorted(peers.items()))
 
 
 @dataclass(frozen=True)
@@ -94,7 +129,10 @@ class PlaitKvMetadata(KVConnectorMetadata):
 
 
 class Store:
-    def __init__(self, address: str, heads: int, head_bytes: int, timeout: float):
+    def __init__(
+        self, address: str, heads: int, head_bytes: int, timeout: float,
+        source: str | None = None,
+    ):
         origin = urlsplit("tcp://" + address)
         if (
             not origin.hostname
@@ -109,6 +147,7 @@ class Store:
         self.heads = heads
         self.head_bytes = head_bytes
         self.timeout = timeout
+        self.source = None if source is None else (source, 0)
 
     def exchange(
         self,
@@ -120,8 +159,17 @@ class Store:
         data: bytes | Callable[[], bytes] = b"",
         *,
         parts: LayerRanges | None = None,
+        peer_manifest: bytes | None = None,
     ) -> bytes | None:
-        if parts is None:
+        if peer_manifest is not None:
+            if verb != b"h" or parts is not None:
+                raise ValueError("Plait KV peer manifest requires a page reservation")
+            header = _HEADER.pack(
+                b"PLAITKV4", verb, key, writer, self.heads,
+                len(peer_manifest) // _PEER.size, 0, self.head_bytes,
+            ) + peer_manifest
+            size = 0
+        elif parts is None:
             header = _HEADER.pack(
                 b"PLAITKV2",
                 verb,
@@ -145,7 +193,7 @@ class Store:
                 self.head_bytes,
             ) + b"".join(_RANGE.pack(*item) for item in parts.ranges)
             size = sum(count for _, count in parts.ranges) * parts.part_bytes
-        with socket.create_connection(self.address, self.timeout) as connection:
+        with socket.create_connection(self.address, self.timeout, self.source) as connection:
             connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             connection.sendall(header)
             with connection.makefile("rb") as reply:
@@ -243,10 +291,27 @@ class PlaitKvConnector(KVConnectorBase_V1):
         timeout = float(extra.get("timeout", 3.0))
         if not 0 < timeout <= 15:
             raise ValueError("invalid Plait KV store timeout")
-        self.store = Store(address, total_heads, head_bytes, timeout)
         self.checkpoint_decode = extra.get("checkpoint_decode", False) is True
         self.checkpoint_only = extra.get("checkpoint_only", False) is True
         self.checkpoint_admission = extra.get("checkpoint_admission", False) is True
+        self.checkpoint_peer_budget = extra.get("checkpoint_peer_budget", False) is True
+        if self.checkpoint_peer_budget and (
+            not self.checkpoint_admission or not self._kv_transfer_config.is_kv_consumer
+        ):
+            raise ValueError("Plait peer budgets require checkpoint admission on a KV consumer")
+        peer = str(_peer_ip(get_ip())) if self.checkpoint_peer_budget else None
+        self.store = Store(address, total_heads, head_bytes, timeout, peer)
+        self.peer_metadata = (
+            PlaitKvPeer(peer, self.heads * len(self.layers) * part_bytes)
+            if peer is not None and role == KVConnectorRole.WORKER
+            else None
+        )
+        self.peer_manifest: bytes | None = None
+        self.peer_ranks = {
+            (p, t)
+            for p in range(parallel.pipeline_parallel_size)
+            for t in range(parallel.tensor_parallel_size)
+        }
         self.checkpoint_writes = (
             self.checkpoint_admission and not self._kv_transfer_config.is_kv_producer
         )
@@ -280,6 +345,23 @@ class PlaitKvConnector(KVConnectorBase_V1):
         self.loads: list[Block] = []
         self.invalid_blocks: set[int] = set()
         self.caches: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+    def get_handshake_metadata(self) -> KVConnectorHandshakeMetadata | None:
+        return self.peer_metadata
+
+    def set_xfer_handshake_metadata_pp_aware(
+        self, metadata: dict[tuple[int, int], KVConnectorHandshakeMetadata]
+    ) -> None:
+        if not self.checkpoint_peer_budget:
+            return
+        if metadata.keys() != self.peer_ranks:
+            raise ValueError("Plait KV peer budgets require metadata from every worker")
+        workers = [item for item in metadata.values() if isinstance(item, PlaitKvPeer)]
+        if len(workers) != len(self.peer_ranks):
+            raise ValueError("Plait KV worker lacks peer budget metadata")
+        self.peer_manifest = _encode_peer_manifest(
+            workers, self.store.heads * self.store.head_bytes
+        )
 
     def _eligible(self, request: Request) -> bool:
         return (
@@ -382,6 +464,12 @@ class PlaitKvConnector(KVConnectorBase_V1):
                 reservation = lease if page >= required_count else None
                 if reservation is None:
                     hit = self.store.exchange(b"H", key)
+                elif self.checkpoint_peer_budget:
+                    if self.peer_manifest is None:
+                        break
+                    hit = self.store.exchange(
+                        b"h", key, writer=reservation, peer_manifest=self.peer_manifest,
+                    )
                 else:
                     hit = self.store.exchange(b"h", key, writer=reservation)
                 if hit is None:

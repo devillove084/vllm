@@ -188,6 +188,7 @@ class MultiprocExecutor(Executor):
                     self.parallel_config,
                     seeded_resume=options.get("seeded_resume") is True,
                     checkpoint_admission=options.get("checkpoint_admission") is True,
+                    checkpoint_peer_budget=options.get("checkpoint_peer_budget") is True,
                 )
                 logger.info(
                     "Plait worker layout %s: node_rank=%d, local worker ranks=%s",
