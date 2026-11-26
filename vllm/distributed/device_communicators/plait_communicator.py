@@ -20,7 +20,7 @@ class PlaitCommunicator(DeviceCommunicatorBase):
         unique_name: str,
     ):
         super().__init__(cpu_group, device, unique_name=unique_name)
-        self.pynccl_comm = PyNcclCommunicator(cpu_group, device)
+        self.pynccl_comm = PyNcclCommunicator(cpu_group, device, use_peer_group=True)
         if self.pynccl_comm.disabled:
             raise RuntimeError("Plait TP communicator is disabled")
 

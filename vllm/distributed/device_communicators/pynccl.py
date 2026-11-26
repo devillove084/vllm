@@ -23,6 +23,7 @@ from vllm.distributed.device_communicators.pynccl_wrapper import (
 )
 from vllm.distributed.utils import StatelessProcessGroup
 from vllm.logger import init_logger
+from vllm.utils.network_utils import get_ip
 from vllm.utils.torch_utils import current_stream
 
 logger = init_logger(__name__)
@@ -125,6 +126,8 @@ class PyNcclCommunicator:
         group: ProcessGroup | StatelessProcessGroup,
         device: int | str | torch.device,
         library_path: str | None = None,
+        *,
+        use_peer_group: bool = False,
     ):
         """Args:
             group: the process group to work on. If None, it will use the
@@ -172,6 +175,17 @@ class PyNcclCommunicator:
         self._suspended = False
 
         self.nccl_version = self.nccl.ncclGetRawVersion()
+        if use_peer_group:
+            if (
+                not envs.VLLM_USE_PLAIT
+                or isinstance(group, StatelessProcessGroup)
+                or dist.get_backend(group) != dist.Backend.GLOO
+            ):
+                raise ValueError("Plait peer startup requires a Gloo process group")
+            self._init_comm(device, peer_group=group)
+            logger.info_once("vLLM TP collectives are using Plait peer transport")
+            return
+
         if self.rank == 0:
             # get the unique id from NCCL
             self.unique_id = self.nccl.ncclGetUniqueId()
@@ -195,12 +209,13 @@ class PyNcclCommunicator:
             self.unique_id = group.broadcast_obj(self.unique_id, src=0)
         self._init_comm(device)
 
-    def _init_comm(self, device: int | str | torch.device) -> None:
-        """Create the communicator on `device` from the already-resolved
-        `self.unique_id` / `self.rank` / `self.world_size`, then run the
-        one-element warm-up all_reduce. Shared by `__init__` and
-        `from_unique_id_bytes` so the init handshake stays identical on both.
-        """
+    def _init_comm(
+        self,
+        device: int | str | torch.device,
+        *,
+        peer_group: ProcessGroup | None = None,
+    ) -> None:
+        """Connect the communicator, then run the one-element warm-up."""
         if isinstance(device, int):
             device = torch.device(f"cuda:{device}")
         elif isinstance(device, str):
@@ -210,9 +225,20 @@ class PyNcclCommunicator:
         self.device = device
         # nccl communicator and stream will use this device
         with torch.accelerator.device_index(device.index):
-            self.comm: ncclComm_t = self.nccl.ncclCommInitRank(
-                self.world_size, self.unique_id, self.rank
-            )
+            if peer_group is None:
+                self.comm: ncclComm_t = self.nccl.ncclCommInitRank(
+                    self.world_size, self.unique_id, self.rank
+                )
+            else:
+
+                def exchange_endpoints(local):
+                    members = [None] * self.world_size
+                    dist.all_gather_object(members, local, group=peer_group)
+                    return members
+
+                self.comm = self.nccl.connect_peers(
+                    get_ip(), self.rank, exchange_endpoints
+                )
 
             if _warmup_deferred():
                 return
