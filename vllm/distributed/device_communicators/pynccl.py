@@ -242,12 +242,18 @@ class PyNcclCommunicator:
         # nccl communicator and stream will use this device
         with torch.accelerator.device_index(device.index):
             if committed_group is not None:
+                options = {}
+                if committed_group.replicated_egress_bytes is not None:
+                    options["replicated_egress_bytes"] = (
+                        committed_group.replicated_egress_bytes
+                    )
                 self.comm = self.nccl.join_versioned_group(
                     get_ip(),
                     committed_group.seeds,
                     committed_group.version,
                     committed_group.devices,
                     self.rank,
+                    **options,
                 )
             elif peer_group is None:
                 self.comm: ncclComm_t = self.nccl.ncclCommInitRank(

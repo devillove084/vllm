@@ -23,6 +23,7 @@ class CommittedGroup:
     seeds: list[str]
     devices: list[tuple[str, int]]
     compute_calibration: GemmCalibration | None = None
+    replicated_egress_bytes: int | None = None
 
     @classmethod
     def load(
@@ -48,7 +49,10 @@ class CommittedGroup:
         calibration = group.get("compute_calibration")
         if calibration is not None:
             calibration = GemmCalibration(**calibration)
-        return cls(group["version"], config["seeds"], devices, calibration)
+        egress = group.get("replicated_egress_bytes")
+        if egress is not None and (type(egress) is not int or not 0 <= egress < 2**64):
+            raise ValueError("Plait replicated_egress_bytes must be an unsigned integer")
+        return cls(group["version"], config["seeds"], devices, calibration, egress)
 
 
 def _open_store(config: "ParallelConfig", *, is_master: bool) -> TCPStore:

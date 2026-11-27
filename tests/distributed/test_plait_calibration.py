@@ -65,3 +65,23 @@ class TestPlaitCalibration(unittest.TestCase):
             pp = CommittedGroup.load(str(path), [0, 1], 0, "pp")
             self.assertIsNotNone(pp)
             self.assertEqual(pp.devices, [tuple(device) for device in devices])
+
+    def test_replicated_egress_limit_is_a_group_option(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "groups.json"
+            host = "00" * 16
+            group = {"ranks": [0], "devices": [[host, 0]], "version": "01" * 16 + "@1"}
+            config = {"host_id": host, "seeds": [], "tp_groups": [group]}
+            for limit in (None, 0, 384 * 1024):
+                with self.subTest(limit=limit):
+                    group["replicated_egress_bytes"] = limit
+                    path.write_text(json.dumps(config))
+                    binding = CommittedGroup.load(str(path), [0], 0)
+                    self.assertIsNotNone(binding)
+                    self.assertEqual(binding.replicated_egress_bytes, limit)
+            for limit in (-1, True, 1.5, 2**64):
+                with self.subTest(limit=limit):
+                    group["replicated_egress_bytes"] = limit
+                    path.write_text(json.dumps(config))
+                    with self.assertRaisesRegex(ValueError, "must be an unsigned integer"):
+                        CommittedGroup.load(str(path), [0], 0)
