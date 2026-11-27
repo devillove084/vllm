@@ -639,7 +639,12 @@ class WorkerProc:
             )
 
             # Initializes a message queue for sending the model output
-            self.worker_response_mq = MessageQueue(1, 1)
+            response_options = {}
+            if envs.is_set("VLLM_MQ_MAX_CHUNK_BYTES_MB"):
+                response_options["max_chunk_bytes"] = (
+                    envs.VLLM_MQ_MAX_CHUNK_BYTES_MB * 1024 * 1024
+                )
+            self.worker_response_mq = MessageQueue(1, 1, **response_options)
             self.peer_response_handles = []
         else:
             # Initialize remote MessageQueue for receiving SchedulerOutput across nodes
