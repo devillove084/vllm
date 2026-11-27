@@ -630,9 +630,12 @@ class GroupCoordinator:
     ):
         from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 
+        max_chunk_bytes = 4 * 1024 * 1024
+        if envs.is_set("VLLM_MQ_MAX_CHUNK_BYTES_MB"):
+            max_chunk_bytes = envs.VLLM_MQ_MAX_CHUNK_BYTES_MB * 1024 * 1024
         return MessageQueue.create_from_process_group_single_reader(
             self.cpu_group,
-            1 << 22,
+            max_chunk_bytes,
             6,
             reader_rank=self.ranks[reader_rank_in_group],
             blocking=blocking,
