@@ -7,7 +7,10 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 
+import vllm.envs as envs
 from vllm.config.model import LogprobsMode
+from vllm.distributed.parallel_state import get_tp_group
+from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import async_tensor_h2d
@@ -23,6 +26,8 @@ from vllm.v1.worker.gpu.sample.sharded_prompt_logprob import (
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.logits_processor import PromptLogitsShard
+
+logger = init_logger(__name__)
 
 CHUNK_SIZE = 1024
 
@@ -44,6 +49,11 @@ class PromptLogprobsWorker:
         self.max_num_reqs = max_num_reqs
         self.device = device
         self.logprobs_mode = logprobs_mode
+        self.logits_shard: PromptLogitsShard | None = None
+        self.submit_logits_fn: (
+            Callable[[torch.Tensor], Callable[[], torch.Tensor]] | None
+        ) = None
+        self.overlap_sharded = False
 
         self.uses_prompt_logprobs = np.zeros(self.max_num_reqs, dtype=bool)
         self.num_prompt_logprobs = np.zeros(self.max_num_reqs, dtype=np.int32)
@@ -51,6 +61,63 @@ class PromptLogprobsWorker:
         self.in_progress_prompt_logprobs: dict[str, list[LogprobsTensors]] = {}
         # req_id -> fixed-ID scoring state
         self.token_id_scores: dict[str, _TokenIdScores] = {}
+
+    def configure_plait(self, model: torch.nn.Module) -> None:
+        from vllm.distributed.device_communicators.plait_communicator import (
+            PlaitCommunicator,
+        )
+
+        tp = get_tp_group()
+        if tp.world_size <= 1 or not isinstance(
+            tp.device_communicator, PlaitCommunicator
+        ):
+            return
+
+        overlap = envs.VLLM_PLAIT_PROMPT_LOGPROBS_OVERLAP
+        get_shard = getattr(model, "prompt_logits_shard", None)
+        get_submitter = getattr(model, "prompt_logits_submitter", None)
+        shard = (
+            get_shard()
+            if envs.VLLM_PLAIT_SHARDED_PROMPT_LOGPROBS and get_shard is not None
+            else None
+        )
+        submitter = get_submitter() if overlap and get_submitter is not None else None
+        if shard is not None and (
+            shard.communicator is not tp.device_communicator
+            or shard.first_token != tp.rank_in_group * shard.shard_width
+            or not (tp.world_size - 1) * shard.shard_width
+            < shard.vocab_size
+            <= tp.world_size * shard.shard_width
+        ):
+            shard = None
+        geometry = (
+            [shard.vocab_size, shard.shard_width] if shard is not None else [0, 0]
+        )
+
+        # Every slot votes once at startup, even with both local flags disabled.
+        # Divergent layouts would issue different operations on the same sequence.
+        local = torch.tensor(
+            [*geometry, int(submitter is not None), int(overlap)],
+            dtype=torch.int64,
+            device="cpu",
+        )
+        gathered = [torch.empty_like(local) for _ in range(tp.world_size)]
+        torch.distributed.all_gather(gathered, local, group=tp.cpu_group)
+        offers = [value.tolist() for value in gathered]
+        self.logits_shard = (
+            shard if all(offer[:2] == geometry for offer in offers) else None
+        )
+        self.submit_logits_fn = submitter if all(offer[2] for offer in offers) else None
+        self.overlap_sharded = self.logits_shard is not None and all(
+            offer[3] for offer in offers
+        )
+        logger.info(
+            "Plait prompt logprobs plan: sharded=%s, "
+            "sharded_overlap=%s, dense_overlap=%s",
+            self.logits_shard is not None,
+            self.overlap_sharded,
+            self.submit_logits_fn is not None,
+        )
 
     def add_request(self, req_id: str, req_idx: int, sampling_params: SamplingParams):
         uses_prompt_logprobs = sampling_params.prompt_logprobs is not None
@@ -133,11 +200,6 @@ class PromptLogprobsWorker:
         num_computed_tokens: torch.Tensor,
         # [max_num_reqs]
         prompt_lens: np.ndarray,
-        *,
-        submit_logits_fn: Callable[[torch.Tensor], Callable[[], torch.Tensor]]
-        | None = None,
-        logits_shard: "PromptLogitsShard | None" = None,
-        overlap_sharded: bool = False,
     ) -> dict[str, LogprobsTensors]:
         idx_mapping_np = input_batch.idx_mapping_np
         needs_prompt_logprobs = self.uses_prompt_logprobs[idx_mapping_np]
@@ -179,9 +241,9 @@ class PromptLogprobsWorker:
                 logits_fn,
                 max_num_prompt_logprobs,
                 self.logprobs_mode,
-                submit_logits_fn=submit_logits_fn,
-                logits_shard=logits_shard,
-                overlap_sharded=overlap_sharded,
+                submit_logits_fn=self.submit_logits_fn,
+                logits_shard=self.logits_shard,
+                overlap_sharded=self.overlap_sharded,
             )
         )
 

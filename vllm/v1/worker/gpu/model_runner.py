@@ -513,6 +513,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.device,
                 logprobs_mode=self.model_config.logprobs_mode,
             )
+            if envs.VLLM_USE_PLAIT:
+                self.prompt_logprobs_worker.configure_plait(self.model)
             self.structured_outputs_worker = StructuredOutputsWorker(
                 max_num_logits=self.max_num_reqs * self.decode_query_len,
                 vocab_size=self.vocab_size,
@@ -2122,17 +2124,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
 
         assert self.prompt_logprobs_worker is not None
-        logits_shard = None
-        if envs.VLLM_PLAIT_SHARDED_PROMPT_LOGPROBS:
-            get_shard = getattr(self.model, "prompt_logits_shard", None)
-            if get_shard is not None:
-                logits_shard = get_shard()
-        submit_logits_fn = None
-        overlap_prompt_logprobs = envs.VLLM_PLAIT_PROMPT_LOGPROBS_OVERLAP
-        if overlap_prompt_logprobs:
-            get_submitter = getattr(self.model, "prompt_logits_submitter", None)
-            if get_submitter is not None:
-                submit_logits_fn = get_submitter()
         prompt_logprobs_dict = self.prompt_logprobs_worker.compute_prompt_logprobs(
             self.model.compute_logits,
             hidden_states,
@@ -2140,9 +2131,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.req_states.all_token_ids.gpu,
             self.req_states.num_computed_tokens.gpu,
             self.req_states.prompt_len.np,
-            submit_logits_fn=submit_logits_fn,
-            logits_shard=logits_shard,
-            overlap_sharded=overlap_prompt_logprobs,
         )
         prompt_token_id_logprobs_dict = (
             self.prompt_logprobs_worker.compute_prompt_token_id_logprobs(

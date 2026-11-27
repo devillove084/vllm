@@ -2,12 +2,57 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
+from types import SimpleNamespace
 
+import pytest
 import torch
 
+from vllm.distributed.device_communicators.plait_communicator import PlaitCommunicator
 from vllm.model_executor.layers.logits_processor import PromptLogitsShard
 from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.worker.gpu.sample import prompt_logprob, sharded_prompt_logprob
+
+
+@pytest.mark.parametrize(
+    ("peer_offer", "expected"),
+    [
+        ([10, 5, 1, 1], (True, True, True)),
+        ([10, 5, 0, 0], (True, False, False)),
+        ([0, 0, 0, 1], (False, False, False)),
+        ([11, 6, 1, 1], (False, False, True)),
+    ],
+)
+def test_plait_prompt_plan_requires_compatible_tp_offers(
+    monkeypatch, peer_offer, expected
+):
+    comm = object.__new__(PlaitCommunicator)
+    cpu_group = object()
+    tp = SimpleNamespace(
+        world_size=2, rank_in_group=0, device_communicator=comm, cpu_group=cpu_group
+    )
+    monkeypatch.setattr(prompt_logprob, "get_tp_group", lambda: tp)
+    monkeypatch.setenv("VLLM_PLAIT_SHARDED_PROMPT_LOGPROBS", "1")
+    monkeypatch.setenv("VLLM_PLAIT_PROMPT_LOGPROBS_OVERLAP", "1")
+    shard = PromptLogitsShard(lambda hidden: hidden, comm, 10, 5, 0)
+    submit = lambda hidden: lambda: hidden
+    model = SimpleNamespace(
+        prompt_logits_shard=lambda: shard, prompt_logits_submitter=lambda: submit
+    )
+
+    def gather(output, value, *, group):
+        assert group is cpu_group
+        assert value.tolist() == [10, 5, 1, 1]
+        output[0].copy_(value)
+        output[1].copy_(value.new_tensor(peer_offer))
+
+    monkeypatch.setattr(torch.distributed, "all_gather", gather)
+    worker = prompt_logprob.PromptLogprobsWorker(1, torch.device("cpu"))
+    worker.configure_plait(model)
+    assert (worker.logits_shard, worker.overlap_sharded, worker.submit_logits_fn) == (
+        shard if expected[0] else None,
+        expected[1],
+        submit if expected[2] else None,
+    )
 
 
 class _Collectives:
