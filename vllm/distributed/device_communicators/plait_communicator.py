@@ -65,6 +65,19 @@ class PlaitCommunicator(DeviceCommunicatorBase):
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
         return self.pynccl_comm.all_reduce(input_.contiguous())
 
+    def try_all_reduce(self, input_: torch.Tensor) -> Callable[[], torch.Tensor] | None:
+        reduce = self.pynccl_comm.try_all_reduce(input_.contiguous())
+        if reduce is None:
+            return None
+        shape, dtype = input_.shape, input_.dtype
+
+        def wait() -> torch.Tensor:
+            output = torch.empty(shape, dtype=dtype, device=self.device)
+            reduce(output)
+            return output
+
+        return wait
+
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
         shards = input_.new_empty((self.world_size, *input_.shape))
         self.pynccl_comm.all_gather(shards, input_.contiguous())

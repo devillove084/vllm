@@ -29,6 +29,8 @@ from vllm.utils.network_utils import get_ip
 from vllm.utils.torch_utils import current_stream
 
 if TYPE_CHECKING:
+    from plait_nccl import PeerRequest
+
     from vllm.distributed.plait_rendezvous import CommittedGroup
 
 logger = init_logger(__name__)
@@ -415,6 +417,27 @@ class PyNcclCommunicator:
         )
 
     @property
+    def supports_all_reduce_requests(self) -> bool:
+        return not self.disabled and getattr(
+            self.comm, "supports_all_reduce_requests", False
+        )
+
+    def try_all_reduce(
+        self, input_tensor: torch.Tensor, op: ReduceOp = ReduceOp.SUM
+    ) -> Callable[[torch.Tensor], None] | None:
+        if not self.supports_all_reduce_requests:
+            return None
+        assert input_tensor.device == self.device and input_tensor.is_contiguous()
+        request = self.comm.try_all_reduce(
+            input_tensor.data_ptr(),
+            input_tensor.numel(),
+            ncclDataTypeEnum.from_torch(input_tensor.dtype),
+            ncclRedOpTypeEnum.from_torch(op),
+            _stream_pointer(self._current_stream()).value or 0,
+        )
+        return None if request is None else self._peer_request_waiter(request)
+
+    @property
     def supports_all_gather_requests(self) -> bool:
         return not self.disabled and getattr(
             self.comm, "supports_all_gather_requests", False
@@ -434,9 +457,11 @@ class PyNcclCommunicator:
             dtype,
             _stream_pointer(self._current_stream()).value or 0,
         )
-        if request is None:
-            return None
+        return None if request is None else self._peer_request_waiter(request)
 
+    def _peer_request_waiter(
+        self, request: "PeerRequest"
+    ) -> Callable[[torch.Tensor], None]:
         def wait(output: torch.Tensor) -> None:
             assert output.device == self.device and output.is_contiguous()
             request.wait(

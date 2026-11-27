@@ -102,7 +102,7 @@ def test_sharded_prompt_scores_gather_only_tied_rows(monkeypatch):
             assert collectives.history == expected
 
 
-def test_sharded_prompt_overlaps_local_projection_with_mixed_gather_modes(monkeypatch):
+def test_sharded_prompt_overlaps_projection_and_rank_sum_in_wire_order(monkeypatch):
     monkeypatch.setattr(prompt_logprob, "CHUNK_SIZE", 2)
     monkeypatch.setattr(sharded_prompt_logprob, "compute_topk_scores", _dense_scores)
     logits = torch.tensor(
@@ -119,6 +119,7 @@ def test_sharded_prompt_overlaps_local_projection_with_mixed_gather_modes(monkey
     rows = torch.arange(len(logits))
     collectives = _Collectives(2)
     events = []
+    rank_events = []
 
     class MixedCommunicator(_Communicator):
         def try_all_gather(self, value, dim=-1):
@@ -132,6 +133,19 @@ def test_sharded_prompt_overlaps_local_projection_with_mixed_gather_modes(monkey
 
             def wait():
                 events.append(("wait", 0))
+                return future.result(timeout=10)
+
+            return wait
+
+        def try_all_reduce(self, value):
+            # The second peer takes the blocking path at the same wire position.
+            if self.rank != 0:
+                return None
+            rank_events.append("submit")
+            future = wire.submit(self.all_reduce, value)
+
+            def wait():
+                rank_events.append("wait")
                 return future.result(timeout=10)
 
             return wait
@@ -154,7 +168,7 @@ def test_sharded_prompt_overlaps_local_projection_with_mixed_gather_modes(monkey
             rows,
             project,
             2,
-            "raw_logits",
+            "raw_logprobs",
             logits_shard=shard,
             overlap_sharded=True,
         )
@@ -165,10 +179,10 @@ def test_sharded_prompt_overlaps_local_projection_with_mixed_gather_modes(monkey
     ):
         actual = list(pool.map(score, range(2)))
 
-    reference = _dense_scores(logits, 2, targets, logits_mode=True)
+    reference = _dense_scores(logits, 2, targets, logits_mode=False)
     for token_ids, scores, ranks in actual:
         torch.testing.assert_close(token_ids, reference.logprob_token_ids)
-        torch.testing.assert_close(scores, reference.logprobs)
+        torch.testing.assert_close(scores, reference.logprobs, atol=2e-6, rtol=0)
         torch.testing.assert_close(ranks, reference.selected_token_ranks)
     assert events == [
         ("project", 0),
@@ -178,12 +192,13 @@ def test_sharded_prompt_overlaps_local_projection_with_mixed_gather_modes(monkey
         ("busy", 2),
         ("project", 4),
     ]
+    assert rank_events == ["submit", "wait", "submit", "wait"]
     assert collectives.history == [
-        ("gather", (2, 8), 0),
+        ("gather", (2, 10), 0),
         ("sum", (2,), 0),
         ("gather", (1, 3), -1),
-        ("gather", (2, 8), 0),
+        ("gather", (2, 10), 0),
         ("sum", (2,), 0),
-        ("gather", (1, 8), 0),
+        ("gather", (1, 10), 0),
         ("gather", (1, 3), -1),
     ]

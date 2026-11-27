@@ -356,7 +356,9 @@ def compute_prompt_logprobs_with_chunking(
                 if wait_metadata is not None
                 else None
             )
-            result = prepared_shard.finish(wait_metadata)
+            result = prepared_shard.finish(
+                wait_metadata, overlap_rank_reduction=overlap_sharded
+            )
             prepared_shard = next_shard
         else:
             if pending is None:

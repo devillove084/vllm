@@ -40,7 +40,8 @@ Issue(slot, seq, async) ==
     /\ \/ seq = consumed[slot] + 1
        \/ /\ ~KeepBlockOrder
           /\ Calls[seq] = Call(Calls[consumed[slot] + 1].block + 1, "summary")
-    /\ async => (Calls[seq].kind = "summary" /\ Calls[seq].block < 3)
+    /\ async => \/ (Calls[seq].kind = "summary" /\ Calls[seq].block < 3)
+                \/ Calls[seq].kind = "rank"
     /\ outstanding' = [outstanding EXCEPT ![slot] = [seq |-> seq, async |-> async]]
     /\ UNCHANGED <<prepared, consumed, ready>>
 

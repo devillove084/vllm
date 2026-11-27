@@ -69,7 +69,12 @@ class PreparedShardedPromptScores:
     def try_submit_metadata(self) -> Callable[[], torch.Tensor] | None:
         return self.shard.communicator.try_all_gather(self.packet, dim=0)
 
-    def finish(self, wait: Callable[[], torch.Tensor] | None = None) -> LogprobsTensors:
+    def finish(
+        self,
+        wait: Callable[[], torch.Tensor] | None = None,
+        *,
+        overlap_rank_reduction: bool = False,
+    ) -> LogprobsTensors:
         shard = self.shard
         comm = shard.communicator
         logits = self.logits
@@ -105,7 +110,12 @@ class PreparedShardedPromptScores:
 
         threshold = selected_scores.to(logits.dtype)[:, None]
         local_ranks = (logits >= threshold).sum(dim=-1, dtype=torch.int32)
-        output_ranks = comm.all_reduce(local_ranks).long()
+        wait_ranks = (
+            comm.try_all_reduce(local_ranks)
+            if overlap_rank_reduction and (not logits_mode or fallback_rows.numel())
+            else None
+        )
+        reduced_ranks = comm.all_reduce(local_ranks) if wait_ranks is None else None
         if not logits_mode:
             maxima = packets[:, :, 2]
             global_max = maxima.amax(dim=0)
@@ -114,8 +124,17 @@ class PreparedShardedPromptScores:
                 :, None
             ]
 
-        if fallback_rows.numel():
-            dense = comm.all_gather(self.projected.index_select(0, fallback_rows))
+        fallback_input = (
+            self.projected.index_select(0, fallback_rows)
+            if fallback_rows.numel()
+            else None
+        )
+        if wait_ranks is not None:
+            reduced_ranks = wait_ranks()
+        assert reduced_ranks is not None
+        output_ranks = reduced_ranks.long()
+        if fallback_input is not None:
+            dense = comm.all_gather(fallback_input)
             fallback_scores = compute_topk_scores(
                 dense[..., : shard.vocab_size],
                 k,
