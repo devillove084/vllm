@@ -446,19 +446,31 @@ class InputProcessor:
                 sampling_params.update_from_tokenizer(self.tokenizer)
             if sampling_params.trace_decode_token_ids:
                 self._normalize_trace_replay_params(sampling_params, prompt_len)
-            kv_params = (sampling_params.extra_args or {}).get("kv_transfer_params")
-            if isinstance(kv_params, dict) and (
+            extra_args = sampling_params.extra_args or {}
+            kv_params = extra_args.get("kv_transfer_params")
+            resume_from_prefix = "plait_resume_token_ids" in extra_args
+            resume_from_kv = isinstance(kv_params, dict) and (
                 "plait_resume_token_ids" in kv_params
                 or "plait_sampling_mode" in kv_params
-            ):
+            )
+            if resume_from_prefix or resume_from_kv:
                 if decoder_input["type"] != "token" or lora_request or resumable:
                     raise VLLMValidationError(
                         "Plait resume requires a plain token prompt"
                     )
-                self._validate_plait_stream(kv_params, sampling_params)
-                if "plait_resume_token_ids" in kv_params:
+                if resume_from_prefix and kv_params is not None:
+                    raise VLLMValidationError(
+                        "Plait prefix resume uses a single source of token history"
+                    )
+                stream_params = extra_args if resume_from_prefix else kv_params
+                self._validate_plait_stream(
+                    stream_params, sampling_params, from_prefix=resume_from_prefix
+                )
+                if "plait_resume_token_ids" in stream_params:
                     plait_resume_token_ids = self._validate_plait_resume_tokens(
-                        kv_params["plait_resume_token_ids"], sampling_params, prompt_len
+                        stream_params["plait_resume_token_ids"],
+                        sampling_params,
+                        prompt_len,
                     )
         else:
             pooling_params = params.clone()
@@ -522,21 +534,27 @@ class InputProcessor:
         )
 
     def _validate_plait_stream(
-        self, kv_params: dict[str, Any], params: SamplingParams
+        self,
+        stream_params: dict[str, Any],
+        params: SamplingParams,
+        *,
+        from_prefix: bool = False,
     ) -> None:
         config = self.vllm_config
+        if not config.use_v2_model_runner or config.speculative_config is not None:
+            raise VLLMValidationError("Plait resume requires the V2 model runner")
         transfer = config.kv_transfer_config
-        if (
+        if not from_prefix and (
             transfer is None
             or transfer.kv_connector != "PlaitKvConnector"
             or not transfer.is_kv_consumer
-            or not config.use_v2_model_runner
-            or config.speculative_config is not None
         ):
             raise VLLMValidationError("Plait resume requires a V2 Plait KV consumer")
-        if "plait_sampling_mode" in kv_params:
+        if "plait_sampling_mode" in stream_params:
             if (
-                kv_params["plait_sampling_mode"] != "seeded-v2"
+                from_prefix
+                or transfer is None
+                or stream_params["plait_sampling_mode"] != "seeded-v2"
                 or not 0 < params.temperature < float("inf")
                 or type(params.seed) is not int
                 or not -(1 << 63) <= params.seed < (1 << 63)

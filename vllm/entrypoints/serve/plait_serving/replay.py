@@ -14,6 +14,8 @@ from .launch import SEEDED_KV_RESUME
 RECOVERY_HEADER = "X-Plait-Stream-Recovery"
 RECOVERY_MODE = "replay-prefix"
 RESUME_KV_MODE = "resume-kv"
+RESUME_PREFIX_MODE = "resume-prefix"
+RESUME_MODES = (RESUME_KV_MODE, RESUME_PREFIX_MODE)
 
 
 class ReplayMismatch(ValueError):
@@ -107,7 +109,7 @@ class CompletionReplay:
         self.seed = (
             self.request.get("seed") if self.request["temperature"] > 0 else None
         )
-        if mode == RESUME_KV_MODE and (
+        if mode in RESUME_MODES and (
             body.get("prompt_logprobs") is not None
             or body.get("structured_outputs")
             or body.get("response_format")
@@ -116,7 +118,7 @@ class CompletionReplay:
             or body.get("prompt_embeds")
             or body.get("vllm_xargs")
         ):
-            raise ValueError("KV resume requires a plain text completion")
+            raise ValueError("Plait resume requires a plain text completion")
         self.payload = json.dumps(self.request).encode()
         self.mode = mode
         self.model = body["model"]
@@ -131,7 +133,7 @@ class CompletionReplay:
         self.prompt_sent = False
 
     def attempt_payload(self) -> bytes:
-        if self.mode != RESUME_KV_MODE or (not self.tokens and self.seed is None):
+        if self.mode not in RESUME_MODES or (not self.tokens and self.seed is None):
             return self.payload
         return json.dumps(self.generation_request()).encode()
 
@@ -140,8 +142,11 @@ class CompletionReplay:
         params = {}
         if self.seed is not None:
             params["plait_sampling_mode"] = SEEDED_KV_RESUME
-        if allow_resume and self.mode == RESUME_KV_MODE and self.tokens:
-            params["plait_resume_token_ids"] = self.tokens.copy()
+        if allow_resume and self.tokens:
+            if self.mode == RESUME_KV_MODE:
+                params["plait_resume_token_ids"] = self.tokens.copy()
+            elif self.mode == RESUME_PREFIX_MODE:
+                request["vllm_xargs"] = {"plait_resume_token_ids": self.tokens.copy()}
         if params:
             request["kv_transfer_params"] = params
         return request
@@ -216,7 +221,7 @@ class CompletionReplay:
             if (
                 first_choice
                 and allow_resume
-                and self.mode == RESUME_KV_MODE
+                and self.mode in RESUME_MODES
                 and reference_ids
             ) and (
                 type(resumed_tokens) is not int or resumed_tokens != len(reference_ids)

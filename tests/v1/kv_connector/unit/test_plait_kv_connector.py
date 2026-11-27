@@ -78,6 +78,14 @@ def test_seeded_stream_requires_the_explicit_sampler_contract() -> None:
     params.temperature = 0
     processor._validate_plait_stream({}, params)
 
+    processor.vllm_config.kv_transfer_config = None
+    processor._validate_plait_stream({}, params, from_prefix=True)
+    with TestCase().assertRaises(VLLMValidationError):
+        processor._validate_plait_stream({}, params)
+    params.temperature = 0.8
+    with TestCase().assertRaises(VLLMValidationError):
+        processor._validate_plait_stream({}, params, from_prefix=True)
+
 
 def test_exports_a_page_after_async_tokens_become_known() -> None:
     connector = object.__new__(PlaitKvConnector)

@@ -33,6 +33,7 @@ from .replay import (
     RECOVERY_HEADER,
     RECOVERY_MODE,
     RESUME_KV_MODE,
+    RESUME_PREFIX_MODE,
     CompletionReplay,
     ReplayMismatch,
     UpstreamInterrupted,
@@ -122,7 +123,7 @@ class ActiveGroupDirectory:
 
 class NativeGroupDirectory(ActiveGroupDirectory):
     observation = "observe"
-    recovery_modes = (RECOVERY_MODE,)
+    recovery_modes = (RECOVERY_MODE, RESUME_PREFIX_MODE)
 
     def __init__(
         self, model: str, group: bytes, control: Control, routes: Path

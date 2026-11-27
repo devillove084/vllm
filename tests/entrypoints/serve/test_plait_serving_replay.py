@@ -8,6 +8,7 @@ import unittest
 
 from vllm.entrypoints.serve.plait_serving.replay import (
     RESUME_KV_MODE,
+    RESUME_PREFIX_MODE,
     CompletionReplay,
     ReplayMismatch,
     UpstreamInterrupted,
@@ -148,6 +149,44 @@ class CompletionReplayTest(unittest.TestCase):
                     out.append,
                 )
         self.assertEqual(out, [frame([1], "A", prompt=[7])])
+
+    def test_prefix_resume_keeps_emitted_history_without_a_kv_connector(self):
+        replay = completion(mode=RESUME_PREFIX_MODE)
+        out = []
+        first = frame([1], "A", prompt=[7])
+        with self.assertRaises(UpstreamInterrupted):
+            replay.drain_attempt(io.BytesIO(first), out.append)
+        body = json.loads(replay.attempt_payload())
+        self.assertEqual(body["prompt"], [7])
+        self.assertEqual(body["vllm_xargs"], {"plait_resume_token_ids": [1]})
+        self.assertNotIn("kv_transfer_params", body)
+        with self.assertRaises(ReplayMismatch):
+            replay.drain_attempt(
+                io.BytesIO(frame([1, 2], "AB", prompt=[7])), out.append
+            )
+        self.assertEqual(out, [first])
+        with self.assertRaises(UpstreamInterrupted):
+            replay.drain_attempt(
+                io.BytesIO(frame([1, 2], "AB", prompt=[7], resumed=1)), out.append
+            )
+        body = json.loads(replay.attempt_payload())
+        self.assertEqual(body["vllm_xargs"], {"plait_resume_token_ids": [1, 2]})
+        replay.drain_attempt(
+            io.BytesIO(
+                frame([1, 2, 3], "ABC", prompt=[7], resumed=2, finish="length") + DONE
+            ),
+            out.append,
+        )
+        bodies = [
+            json.loads(line[6:])
+            for line in b"".join(out).splitlines()
+            if line.startswith(b"data: {")
+        ]
+        self.assertEqual(
+            [choice["token_ids"] for body in bodies for choice in body["choices"]],
+            [[1], [2], [3]],
+        )
+        self.assertNotIn(b"plait_resumed_tokens", b"".join(out))
 
     def test_seeded_resume_requires_a_seed_acknowledgment_before_emitting(self):
         request = {

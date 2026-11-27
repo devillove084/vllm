@@ -296,7 +296,9 @@ class OpenAIServingCompletion(GenerateBaseServing):
         num_cached_tokens = None
         first_iteration = True
         kv_params = request.kv_transfer_params or {}
-        plait_resume_token_ids = kv_params.get("plait_resume_token_ids")
+        plait_resume_token_ids = (request.vllm_xargs or {}).get(
+            "plait_resume_token_ids"
+        ) or kv_params.get("plait_resume_token_ids")
         plait_seeded = kv_params.get("plait_sampling_mode") == "seeded-v2"
 
         stream_options = request.stream_options

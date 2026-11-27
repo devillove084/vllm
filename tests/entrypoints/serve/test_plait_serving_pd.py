@@ -59,6 +59,7 @@ from vllm.entrypoints.serve.plait_serving.replay import (
     RECOVERY_HEADER,
     RECOVERY_MODE,
     RESUME_KV_MODE,
+    RESUME_PREFIX_MODE,
     sse,
 )
 
@@ -1261,11 +1262,12 @@ class HandoffTest(unittest.TestCase):
         directory.endpoint.assert_called_once()
 
     def test_native_ingress_recovers_only_a_checked_greedy_prefix(self):
-        for matches_prefix in (True, False):
-            with self.subTest(matches_prefix=matches_prefix):
-                self._check_native_prefix_recovery(matches_prefix)
+        for recovery in (RECOVERY_MODE, RESUME_PREFIX_MODE):
+            for matches_prefix in (True, False):
+                with self.subTest(recovery=recovery, matches_prefix=matches_prefix):
+                    self._check_native_prefix_recovery(recovery, matches_prefix)
 
-    def _check_native_prefix_recovery(self, matches_prefix):
+    def _check_native_prefix_recovery(self, recovery, matches_prefix):
         group = bytes.fromhex("0a" * 16)
         versions = [f"{group.hex()}@{epoch}" for epoch in (1, 2)]
         control = Mock()
@@ -1284,7 +1286,7 @@ class HandoffTest(unittest.TestCase):
             binding = Path(folder) / "routes.json"
             directory = aggregate.NativeGroupDirectory("test", group, control, binding)
 
-            def chunk(identity, text, tokens, prompt=None):
+            def chunk(identity, text, tokens, prompt=None, *, resumed=None):
                 choice = {
                     "index": 0,
                     "text": text,
@@ -1293,6 +1295,8 @@ class HandoffTest(unittest.TestCase):
                 }
                 if prompt is not None:
                     choice["prompt_token_ids"] = prompt
+                if resumed is not None:
+                    choice["plait_resumed_tokens"] = resumed
                 return sse({"id": identity, "model": "test", "choices": [choice]})
 
             def old_engine(body):
@@ -1302,8 +1306,13 @@ class HandoffTest(unittest.TestCase):
 
             def new_engine(body):
                 self.assertNotIn("kv_transfer_params", body)
+                if recovery == RESUME_PREFIX_MODE:
+                    self.assertEqual(
+                        body["vllm_xargs"], {"plait_resume_token_ids": [8]}
+                    )
                 text = "ab" if matches_prefix else "xb"
-                stream = chunk("second", text, [8, 9], [4])
+                resumed = 1 if recovery == RESUME_PREFIX_MODE else None
+                stream = chunk("second", text, [8, 9], [4], resumed=resumed)
                 stream += chunk("second", "", []) + b"data: [DONE]\n\n"
                 return "text/event-stream", stream
 
@@ -1340,7 +1349,7 @@ class HandoffTest(unittest.TestCase):
                 ingress,
                 COMPLETIONS,
                 payload,
-                {RECOVERY_HEADER: RECOVERY_MODE},
+                {RECOVERY_HEADER: recovery},
             )
             self.assertEqual((status, headers[VERSION_HEADER]), (200, versions[0]))
             items = [
