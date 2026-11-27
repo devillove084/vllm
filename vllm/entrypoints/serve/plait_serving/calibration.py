@@ -119,6 +119,7 @@ class Target:
     active: frozenset[str]
     routes: tuple[tuple[Endpoint, ...], ...]
     devices: int
+    manifest: str | None = None
 
     @property
     def versions(self) -> frozenset[str]:

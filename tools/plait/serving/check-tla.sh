@@ -25,3 +25,4 @@ check PlaitPdStreamReplay PlaitPdStreamReplay
 check PlaitServingModePolicy PlaitServingModePolicy
 check PlaitServingProvision PlaitServingProvision
 check PlaitServingCalibration PlaitServingCalibration
+check PlaitServingProfileRestore PlaitServingProfileRestore

@@ -54,6 +54,7 @@ from vllm.entrypoints.serve.plait_serving.launch import (
     resident_spec,
 )
 from vllm.entrypoints.serve.plait_serving.load import Load
+from vllm.entrypoints.serve.plait_serving.mode_state import ProfileStore
 from vllm.entrypoints.serve.plait_serving.replay import (
     RECOVERY_HEADER,
     RECOVERY_MODE,
@@ -428,6 +429,21 @@ class LaunchTest(unittest.TestCase):
 
 
 class CalibrationTest(unittest.TestCase):
+    def test_a_late_writer_preserves_the_newer_measurement_of_the_same_layout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ProfileStore(Path(directory) / "capacity.json")
+            identity = {
+                "context": "settings",
+                "versions": ["layout"],
+                "binding": "routes",
+                "manifest": "grants",
+            }
+            latest = {**identity, "slo_profile": {"rps": 2, "valid_until_ms": 4000}}
+            delayed = {**identity, "slo_profile": {"rps": 1, "valid_until_ms": 2000}}
+            store.save(latest, 1000)
+            self.assertEqual(store.save(delayed, 1000), latest)
+            self.assertEqual(store.read(), [latest])
+
     def test_successful_process_observed_after_deadline_cannot_publish(self):
         settings = Settings("/model", 16, 8, (2,), (1,), 100, 20)
         calibrator = Calibrator(Mock())
@@ -768,6 +784,9 @@ class ModePolicyTest(unittest.TestCase):
         self.ready = {prefill, decode}
         self.requests = []
         self.plans = []
+        self.preparations = {}
+        self.aborts = []
+        self.tickets = {}
         self.plan_reply = {"decision": "pending"}
         self.may_lose_reply = False
         self.control = Mock()
@@ -796,6 +815,8 @@ class ModePolicyTest(unittest.TestCase):
         }
 
     def request(self, request):
+        if request["request"] == "preparation":
+            return {"preparation": self.preparations.get(bytes(request["group"]).hex())}
         if request["request"] == "plan_set":
             self.plans.append(request)
             if self.may_lose_reply:
@@ -810,8 +831,24 @@ class ModePolicyTest(unittest.TestCase):
                 if epoch in self.active
                 else ("Ready" if epoch in self.ready else "Preparing")
             )
-            return {"group": {"phase": phase, "version": version, "grants": [{}]}}
-        transition = request["operation"]["action"]["SwitchActiveSet"]["transitions"]
+            return {
+                "group": {
+                    "phase": phase,
+                    "version": version,
+                    "grants": [{}],
+                    "manifest": {"ticket": self.tickets.get(epoch, epoch)},
+                }
+            }
+        action = request["operation"]["action"]
+        if "AbortFailedSet" in action:
+            self.aborts.append(request)
+            if self.may_lose_reply:
+                self.may_lose_reply = False
+                raise mode.ControlError("reply lost")
+            return {
+                "result": {"Ok": {"AbortedSet": action["AbortFailedSet"]["versions"]}}
+            }
+        transition = action["SwitchActiveSet"]["transitions"]
         self.requests.append(request)
         if self.may_lose_reply:
             self.may_lose_reply = False
@@ -991,6 +1028,70 @@ class ModePolicyTest(unittest.TestCase):
         self.controller.model = "test"
         self.sample(0, seconds=0)
         return calibrator
+
+    def test_restarts_with_a_durable_incumbent_profile_and_rechecks_its_manifest(self):
+        calibrator = self.configure_calibration()
+        store = ProfileStore(self.policy.with_name("capacity.json"))
+        self.controller.profile_store = store
+        self.sample(12)
+        self.sample(12)
+        target = calibrator.start.call_args.args[0]
+        calibrator.run = SimpleNamespace(target=target)
+        calibrator.poll.side_effect = lambda settings: self.target["slo_profile"]
+        self.sample(12)
+        self.assertEqual(store.read()[0]["manifest"], target.manifest)
+        self.active = target.versions
+        self.ready = {self.versions[-1]}
+        self.config["modes"] = []
+        self.policy.write_text(json.dumps(self.config))
+        self.controller = mode.ModeController(
+            self.policy, self.load, self.control, "test", profile_store=store
+        )
+        self.sample(0, seconds=0)
+        self.assertIn(target.versions, self.controller.measured)
+        self.config["modes"].append(self.profile([self.versions[-1]], 1, 4))
+        self.policy.write_text(json.dumps(self.config))
+        self.sample(1)
+        self.sample(1)
+        self.sample(1)
+        self.assertEqual(len(self.requests), 1)
+
+        self.tickets[self.versions[1]] = "different group incarnation"
+        self.controller = mode.ModeController(
+            self.policy, self.load, self.control, "test", profile_store=store
+        )
+        self.sample(0, seconds=0)
+        self.assertEqual(self.controller.measured, {})
+
+    def test_reaps_only_the_committed_failed_set_with_the_same_request_on_retry(self):
+        self.configure_provision()
+        groups = self.groups[1:3]
+        versions = [
+            {"group": list(bytes.fromhex(group)), "epoch": 1} for group in groups
+        ]
+        preparation = {
+            "prepare": {"origin": [1] * 16, "counter": 5},
+            "members": [[versions[0], "Ready"], [versions[1], "Retired"]],
+            "activated": True,
+        }
+        self.preparations = dict.fromkeys(groups, preparation)
+        self.sample(0, seconds=0)
+        self.assertEqual(self.aborts, [])
+        preparation["activated"] = False
+        self.may_lose_reply = True
+        self.sample(0)
+        self.assertEqual(len(self.aborts), 2)
+        self.assertEqual(self.aborts[0], self.aborts[1])
+        self.assertEqual(
+            self.aborts[0]["operation"]["action"],
+            {
+                "AbortFailedSet": {
+                    "prepare": preparation["prepare"],
+                    "versions": versions,
+                }
+            },
+        )
+        self.assertEqual(self.requests, [])
 
     def test_uses_live_calibration_to_switch_and_as_the_next_incumbent(self):
         calibrator = self.configure_calibration()

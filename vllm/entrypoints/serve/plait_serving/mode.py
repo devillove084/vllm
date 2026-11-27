@@ -8,7 +8,7 @@ import re
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from vllm.entrypoints.serve.plait_deploy import Deployment
@@ -22,6 +22,7 @@ from .group import (
     endpoint_ready,
 )
 from .load import Load
+from .mode_state import ProfileStore, fingerprint
 
 VERSION = re.compile(r"[a-f0-9]{32}@[1-9][0-9]*")
 GROUP_ID = re.compile(r"[a-f0-9]{32}")
@@ -160,7 +161,6 @@ class Policy:
             or revision < 1
             or type(stable) is not int
             or stable < 1
-            or not modes
             or len({mode.versions for mode in modes}) != len(modes)
         ):
             raise ValueError("invalid serving mode policy")
@@ -246,18 +246,22 @@ class ModeController:
         control: Control,
         model: str | None = None,
         calibrator: Calibrator | None = None,
+        profile_store: ProfileStore | None = None,
     ):
         self.path = policy
         self.load = load
         self.control = control
         self.model = model
         self.calibrator = calibrator
+        self.profile_store = profile_store
+        self.restore_pending: list[dict] = []
         self.measured: dict[frozenset[str], tuple[Target, Capacity]] = {}
         self.previous: dict | None = None
         self.last_policy: Policy | None = None
         self.proposal: tuple[Capacity, Capacity | Provision] | None = None
         self.windows = 0
         self.cooldown_until = 0.0
+        self.recover_at = 0.0
 
     def reset_evidence(self) -> None:
         self.previous = None
@@ -330,10 +334,14 @@ class ModeController:
                 or policy.calibration != self.last_policy.calibration
             ):
                 self.measured.clear()
+                self.restore_pending = self.load_profiles(policy)
             if self.calibrator is not None:
                 self.calibrator.cancel()
             self.last_policy = policy
             self.reset_evidence()
+        if view.revision == policy.route_revision:
+            self.reap_failed_sets(policy)
+            self.restore_profiles(view)
         self.finish_calibration(view, policy, snapshot)
         demand = self.sample(policy.window_seconds)
         if (
@@ -446,6 +454,117 @@ class ModeController:
         self.proposal = None
         self.windows = 0
 
+    def reap_failed_sets(self, policy: Policy) -> None:
+        now = time.monotonic()
+        if not policy.provision or now < self.recover_at:
+            return
+        self.recover_at = now + 1.0
+        groups = {member.group for plan in policy.provision for member in plan.members}
+        visited = set()
+        for group in sorted(groups):
+            if group in visited:
+                continue
+            preparation = self.control.request(
+                {
+                    "request": "preparation",
+                    "group": list(bytes.fromhex(group)),
+                }
+            )["preparation"]
+            if preparation is None:
+                continue
+            members = preparation["members"]
+            versions = [version for version, _ in members]
+            phases = {phase for _, phase in members}
+            if (
+                preparation["activated"]
+                or not phases.intersection(("Revoked", "Retired"))
+                or not phases.intersection(("Preparing", "Ready"))
+            ):
+                continue
+            visited.update(bytes(version["group"]).hex() for version in versions)
+            request = {
+                "request": "apply",
+                "operation": {
+                    "id": self.control.next_operation_id(),
+                    "action": {
+                        "AbortFailedSet": {
+                            "prepare": preparation["prepare"],
+                            "versions": versions,
+                        }
+                    },
+                },
+            }
+            try:
+                result = self.control.request(request)["result"]
+            except ControlError:
+                result = self.control.request(request)["result"]
+            if "Ok" not in result:
+                if result["Err"] in ("PreparationActivated", "PreparationHealthy"):
+                    continue
+                raise ControlError(
+                    f"Plait rejected candidate rollback: {result['Err']}"
+                )
+            if result["Ok"]["AbortedSet"] != versions:
+                raise ControlError("Plait returned a different aborted candidate set")
+            print("Plait revoked an incomplete candidate set", flush=True)
+
+    def state_context(self, policy: Policy) -> str:
+        return fingerprint(
+            {
+                "model": self.model,
+                "revision": policy.route_revision,
+                "settings": asdict(policy.calibration)
+                if policy.calibration is not None
+                else None,
+            }
+        )
+
+    def load_profiles(self, policy: Policy) -> list[dict]:
+        if self.profile_store is None or policy.calibration is None:
+            return []
+        context = self.state_context(policy)
+        try:
+            return [
+                record
+                for record in self.profile_store.read()
+                if record["context"] == context
+            ]
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            print(f"Plait could not restore calibration profiles: {error}", flush=True)
+            return []
+
+    def restore_profiles(self, view: ModeView) -> None:
+        waiting = []
+        now_ms = time.time_ns() // 1_000_000
+        for record in self.restore_pending:
+            try:
+                capacity = Capacity.read(record)
+                manifest = record["manifest"]
+                binding = record["binding"]
+            except (ValueError, KeyError, TypeError, OverflowError):
+                continue
+            if capacity.valid_until_ms <= now_ms:
+                continue
+            routes = tuple(
+                path
+                for path in view.routes
+                if all(endpoint.version in capacity.versions for endpoint in path)
+            )
+            if not endpoints_for(capacity.versions, routes):
+                waiting.append(record)
+                continue
+            if route_fingerprint(routes) != binding:
+                continue
+            layout = self.inspect_layout(capacity.versions, routes, view.active)
+            if layout is None:
+                waiting.append(record)
+            elif layout == (capacity.devices, manifest) and manifest is not None:
+                target = Target(
+                    view.revision, view.active, routes, capacity.devices, manifest
+                )
+                self.measured[capacity.versions] = (target, capacity)
+        self.restore_pending = waiting
+
     def calibrate(
         self, view: ModeView, projection: Provision, settings: Settings | None
     ) -> bool:
@@ -455,10 +574,11 @@ class ModeController:
         if not routes:
             return False
         versions = frozenset(endpoint.version for path in routes for endpoint in path)
-        devices = self.device_count(versions, routes, view.active)
-        if devices is not None:
+        layout = self.inspect_layout(versions, routes, view.active)
+        if layout is not None:
+            devices, manifest = layout
             self.calibrator.start(
-                Target(view.revision, view.active, routes, devices),
+                Target(view.revision, view.active, routes, devices, manifest),
                 settings,
                 self.model,
             )
@@ -486,10 +606,8 @@ class ModeController:
                 "slo_profile": result,
             }
         )
-        if (
-            self.device_count(target.versions, target.routes, view.active)
-            != target.devices
-        ):
+        layout = self.inspect_layout(target.versions, target.routes, view.active)
+        if layout != (target.devices, target.manifest):
             return
         current = snapshot()
         if (
@@ -499,6 +617,23 @@ class ModeController:
             or capacity.valid_until_ms <= time.time_ns() // 1_000_000
         ):
             return
+        if self.profile_store is not None:
+            if target.manifest is None:
+                raise ControlError(
+                    "calibration state requires committed group manifests"
+                )
+            persisted = self.profile_store.save(
+                {
+                    "context": self.state_context(policy),
+                    "versions": sorted(target.versions),
+                    "devices": target.devices,
+                    "slo_profile": result,
+                    "binding": route_fingerprint(target.routes),
+                    "manifest": target.manifest,
+                },
+                time.time_ns() // 1_000_000,
+            )
+            capacity = Capacity.read(persisted)
         self.measured[target.versions] = (target, capacity)
         print(
             f"Plait measured candidate capacity {capacity.rps:.2f} requests/s",
@@ -542,23 +677,32 @@ class ModeController:
         *,
         verify_http: bool = True,
     ) -> bool:
+        layout = self.inspect_layout(
+            mode.versions, routes, active, verify_http=verify_http
+        )
+        if layout is None or layout[0] != mode.devices:
+            return False
+        measured = self.measured.get(mode.versions)
         return (
-            self.device_count(mode.versions, routes, active, verify_http=verify_http)
-            == mode.devices
+            measured is None
+            or measured[1] != mode
+            or measured[0].manifest is None
+            or measured[0].manifest == layout[1]
         )
 
-    def device_count(
+    def inspect_layout(
         self,
         versions: frozenset[str],
         routes: tuple[tuple[Endpoint, ...], ...],
         active: frozenset[str],
         *,
         verify_http: bool = True,
-    ) -> int | None:
+    ) -> tuple[int, str | None] | None:
         endpoints = endpoints_for(versions, routes)
         if not endpoints:
             return None
         devices = 0
+        manifests = []
         for endpoint in endpoints:
             group, epoch = endpoint.version.split("@", 1)
             version = {"group": list(bytes.fromhex(group)), "epoch": int(epoch)}
@@ -571,7 +715,9 @@ class ModeController:
             if verify_http and not endpoint_ready(endpoint, 1.0):
                 return None
             devices += len(view["grants"])
-        return devices
+            manifests.append(view.get("manifest"))
+        identity = fingerprint(manifests) if all(manifests) else None
+        return devices, identity
 
     def switch(
         self, groups: tuple[str, ...], active: frozenset[str], target: frozenset[str]
@@ -614,3 +760,7 @@ def active_epochs(versions: frozenset[str]) -> dict[str, int]:
         for version in versions
         for group, epoch in (version.split("@", 1),)
     }
+
+
+def route_fingerprint(routes: tuple[tuple[Endpoint, ...], ...]) -> str:
+    return fingerprint([[asdict(endpoint) for endpoint in path] for path in routes])

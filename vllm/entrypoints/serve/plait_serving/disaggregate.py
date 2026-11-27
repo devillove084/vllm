@@ -42,6 +42,7 @@ from .load import Load
 from .load import listen as load_listener
 from .load import parse_address as parse_load_address
 from .mode import ModeController, ModeView
+from .mode_state import ProfileStore
 from .replay import (
     RECOVERY_HEADER,
     RECOVERY_MODE,
@@ -908,6 +909,9 @@ def main() -> None:
         type=Path,
         help="prepare and switch native layouts using serving capacity profiles",
     )
+    parser.add_argument(
+        "--mode-state", type=Path, help="persist validated calibration profiles locally"
+    )
     parser.add_argument("--timeout", type=float, default=120.0)
     args = parser.parse_args()
     if not 0 < args.port < 65536 or not 0 < args.timeout < float("inf"):
@@ -932,6 +936,8 @@ def main() -> None:
         parser.error("--model requires at least one --control-peer")
     if args.mode_policy is not None and args.native_routes is None:
         parser.error("--mode-policy requires --native-routes")
+    if args.mode_state is not None and args.mode_policy is None:
+        parser.error("--mode-state requires --mode-policy")
     if args.kv_transport is None:
         args.kv_transport = "nixl"
     load = (
@@ -1014,6 +1020,7 @@ def route_source(args: argparse.Namespace, load: Load | None = None):
             Calibrator(
                 lambda target: calibration_ingress(directory, target, args.timeout)
             ),
+            ProfileStore(args.mode_state) if args.mode_state is not None else None,
         )
         threads.append(
             threading.Thread(
