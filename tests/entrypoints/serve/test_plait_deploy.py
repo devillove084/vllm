@@ -115,6 +115,30 @@ class TestPlaitDeployment(unittest.TestCase):
                 [self.second, 1],
             ]
 
+    def test_committed_recipe_disambiguates_layouts_with_the_same_width(self):
+        tensor = "04" * 16
+        pipeline = "05" * 16
+        self.config.layout_recipes = {
+            tensor: {"width": 2},
+            pipeline: {"width": 2, "pipeline_layers": [11, 17]},
+        }
+        view = {
+            "version": self.placement.version,
+            "grants": [
+                {"device": {"node": [2] * 16, "ordinal": 1}},
+                {"device": {"node": [1] * 16, "ordinal": 2}},
+            ],
+        }
+        with self.assertRaisesRegex(ValueError, "recipe-aware"):
+            self.config.place(view)
+        tensor_placement = self.config.place({**view, "recipe": [4] * 16})
+        pipeline_placement = self.config.place({**view, "recipe": [5] * 16})
+        assert tensor_placement.devices == pipeline_placement.devices
+        assert tensor_placement.pipeline_layers == ()
+        assert pipeline_placement.pipeline_layers == (11, 17)
+        with self.assertRaisesRegex(ValueError, "committed recipe"):
+            self.config.place({**view, "recipe": [6] * 16})
+
     def test_activation_stages_binding_and_retries_the_same_operation(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "routes.json"

@@ -54,10 +54,18 @@ class Control:
             raise ControlUnavailable(reply["error"])
         return reply
 
-    def observe(self, version: dict) -> dict | None:
-        result = self.request("observe", id=operation_id(), **version)["result"]
+    def observe(self, version: dict, *, with_recipe: bool = False) -> dict | None:
+        fields = {"with_recipe": True} if with_recipe else {}
+        reply = self.request("observe", id=operation_id(), **version, **fields)
+        result = reply["result"]
         if "Ok" in result:
-            return result["Ok"]
+            view = result["Ok"]
+            if with_recipe and "recipe" in reply:
+                binding = reply["recipe"]
+                if binding["version"] != view["version"]:
+                    raise ControlUnavailable("recipe and group view versions differ")
+                view["recipe"] = binding["recipe"]
+            return view
         if isinstance(result["Err"], dict) and "UnknownVersion" in result["Err"]:
             return None
         raise ControlUnavailable(f"Plait observation rejected: {result['Err']}")
@@ -86,6 +94,7 @@ class Deployment:
     max_num_batched_tokens: int = 2048
     max_num_seqs: int = 128
     pipeline_layers: dict[str, list[int]] | None = None
+    layout_recipes: dict[str, dict] | None = None
 
     def __post_init__(self) -> None:
         parse_id(self.group_id)
@@ -101,6 +110,27 @@ class Deployment:
             ):
                 raise ValueError(
                     "pipeline_layers needs one positive layer count per stage"
+                )
+        for recipe_id, recipe in (self.layout_recipes or {}).items():
+            parse_id(recipe_id)
+            width = recipe.get("width")
+            layers = recipe.get("pipeline_layers", [])
+            if (
+                set(recipe) - {"width", "pipeline_layers"}
+                or type(width) is not int
+                or width < 1
+                or not isinstance(layers, list)
+                or (
+                    layers
+                    and (
+                        len(layers) != width
+                        or width < 2
+                        or any(type(layer) is not int or layer < 1 for layer in layers)
+                    )
+                )
+            ):
+                raise ValueError(
+                    "layout recipe needs a width and valid pipeline layers"
                 )
         for host, address in self.hosts.items():
             parse_id(host)
@@ -130,6 +160,18 @@ class Deployment:
         ordered = {host: sorted(ordinals) for host, ordinals in sorted(devices.items())}
         width = sum(len(ordinals) for ordinals in ordered.values())
         layers = (self.pipeline_layers or {}).get(str(width), ())
+        if "recipe" not in view and self.layout_recipes:
+            raise ValueError(
+                "layout recipes require a recipe-aware Plait control plane"
+            )
+        if view.get("recipe") is not None:
+            recipe_id = bytes(view["recipe"]).hex()
+            recipe = (self.layout_recipes or {}).get(recipe_id)
+            if recipe is None or recipe["width"] != width:
+                raise ValueError(
+                    f"missing launch definition for committed recipe {recipe_id}"
+                )
+            layers = recipe.get("pipeline_layers", ())
         offset = (version["epoch"] - 1) % self.epoch_ports
         return Placement(
             version,
@@ -529,7 +571,7 @@ def supervise(
                         and router.bound_epoch != epoch
                     )
                     if launch or route:
-                        view = control.observe(version)
+                        view = control.observe(version, with_recipe=True)
                         if view is not None and view["phase"] == phase:
                             placement = deployment.place(view)
                             if (
