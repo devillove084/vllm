@@ -16,7 +16,7 @@ import tempfile
 import time
 import uuid
 from contextlib import ExitStack, closing, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from http.client import HTTPConnection, HTTPException
 from pathlib import Path
 from socket import AF_INET
@@ -100,6 +100,19 @@ class Deployment:
     max_num_seqs: int = 128
     pipeline_layers: dict[str, list[int]] | None = None
     layout_recipes: dict[str, dict] | None = None
+
+    @classmethod
+    def read(cls, path: Path) -> "Deployment":
+        return cls(**json.loads(path.read_text(encoding="utf-8")))
+
+    def reload_hosts(self, path: Path) -> "Deployment":
+        updated = self.read(path)
+        if (
+            replace(updated, hosts=self.hosts) != self
+            or not self.hosts.items() <= updated.hosts.items()
+        ):
+            raise ValueError("live deployment changes may only add host addresses")
+        return updated
 
     def __post_init__(self) -> None:
         parse_id(self.group_id)
@@ -544,6 +557,7 @@ def supervise(
     engine: Engine | None,
     state: Path | None,
     router: RoutePublisher | None,
+    deployment_file: Path | None = None,
 ) -> None:
     group = list(parse_id(deployment.group_id))
     children: dict[int, WorkerProcess] = {}
@@ -582,6 +596,8 @@ def supervise(
                         and router.bound_epoch != epoch
                     )
                     if launch or route:
+                        if deployment_file is not None:
+                            deployment = deployment.reload_hosts(deployment_file)
                         view = control.observe(version, with_recipe=True)
                         if view is not None and view["phase"] == phase:
                             placement = deployment.place(view)
@@ -647,7 +663,7 @@ def main() -> None:
         parser.error("provide --engine or --routes")
     if args.engine is not None and (args.host_id is None or args.state_dir is None):
         parser.error("--engine requires --host-id and --state-dir")
-    deployment = Deployment(**json.loads(args.deployment.read_text(encoding="utf-8")))
+    deployment = Deployment.read(args.deployment)
     engine = None
     if args.engine is not None:
         if args.host_id not in deployment.hosts:
@@ -672,7 +688,15 @@ def main() -> None:
                 lock = stack.enter_context(args.routes.with_suffix(".lock").open("a"))
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 router = RoutePublisher(args.routes)
-            supervise(deployment, control, args.host_id, engine, args.state_dir, router)
+            supervise(
+                deployment,
+                control,
+                args.host_id,
+                engine,
+                args.state_dir,
+                router,
+                args.deployment,
+            )
     except KeyboardInterrupt:
         pass
 

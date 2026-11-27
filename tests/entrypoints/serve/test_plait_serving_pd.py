@@ -446,7 +446,100 @@ class CalibrationTest(unittest.TestCase):
         self.assertEqual([point["passes"] for point in points], [True, False, True])
 
 
+def native_deployment(group: str, host: str, port: int) -> dict:
+    return {
+        "group_id": group,
+        "model_alias": "test",
+        "seeds": ["127.0.0.1:7950"],
+        "hosts": {host: "192.0.2.1"},
+        "api_port_base": port,
+        "rendezvous_port_base": port + 100,
+        "epoch_ports": 2,
+    }
+
+
 class DirectoryTest(unittest.TestCase):
+    def test_discovery_derives_new_origins_from_grants_and_admits_a_complete_path(self):
+        groups = [(bytes([index] * 16)).hex() for index in range(1, 4)]
+        keys = [list(bytes.fromhex(group)) for group in groups]
+        active = [1, None, None]
+        phases = ["Active", "Ready", "Preparing"]
+        host = [7] * 16
+
+        def request(message):
+            if message["request"] == "apply":
+                return {
+                    "result": {
+                        "Ok": {"ActiveSet": list(zip(keys, active, strict=True))}
+                    }
+                }
+            if message["request"] == "placement":
+                key = message["group"]
+                version = {"group": key, "epoch": 1}
+                return {"placement": {"latest": [version, phases[keys.index(key)]]}}
+            version = message["version"]
+            phase = phases[keys.index(version["group"])]
+            return {
+                "group": {
+                    "version": version,
+                    "phase": phase,
+                    "grants": [
+                        {"device": {"node": host, "ordinal": 0}},
+                    ],
+                }
+            }
+
+        control = Mock()
+        control.request.side_effect = request
+        with tempfile.TemporaryDirectory() as folder:
+            config = Path(folder) / "routes.json"
+            sources = {}
+            for index, group in enumerate(groups):
+                path = config.with_name(f"group-{index}.json")
+                path.write_text(
+                    json.dumps(
+                        native_deployment(group, bytes(host).hex(), 8100 + 4 * index)
+                    )
+                )
+                sources[group] = path.name
+            config.write_text(
+                json.dumps(
+                    {
+                        "model": "test",
+                        "revision": 1,
+                        "paths": [],
+                        "discover": {
+                            "deployments": sources,
+                            "aggregated": [groups[0]],
+                            "paths": [
+                                {
+                                    "prefill": groups[1],
+                                    "decode": groups[2],
+                                    "kv_host": "192.0.2.2",
+                                    "kv_port": 7952,
+                                }
+                            ],
+                        },
+                    }
+                )
+            )
+            directory = disaggregate.NativeDirectory("test", control, config)
+            directory.refresh()
+            self.assertEqual(len(directory.mode_snapshot().routes), 1)
+            phases[2] = "Ready"
+            directory.refresh()
+            self.assertEqual(len(directory.mode_snapshot().routes), 2)
+            [incumbent] = directory.routes()[1]
+            self.assertEqual(incumbent.port, 8100)
+            active[:] = [None, 1, 1]
+            phases[:] = ["Draining", "Active", "Active"]
+            directory.refresh()
+            [route] = directory.routes()[1]
+            self.assertEqual(
+                (route.prefill.port, route.decode.port, route.kv_port),
+                (8104, 8108, 7952),
+            )
+
     def test_native_pd_requires_both_ends_of_one_active_set(self):
         groups = [bytes([index] * 16).hex() for index in (1, 2, 3)]
         versions = [f"{group}@1" for group in groups]
@@ -648,6 +741,8 @@ class ModePolicyTest(unittest.TestCase):
         self.active = frozenset([aggregate])
         self.ready = {prefill, decode}
         self.requests = []
+        self.plans = []
+        self.plan_reply = {"decision": "pending"}
         self.may_lose_reply = False
         self.control = Mock()
         self.control.next_operation_id.return_value = "operation-id"
@@ -675,6 +770,12 @@ class ModePolicyTest(unittest.TestCase):
         }
 
     def request(self, request):
+        if request["request"] == "plan_set":
+            self.plans.append(request)
+            if self.may_lose_reply:
+                self.may_lose_reply = False
+                raise mode.ControlError("reply lost")
+            return self.plan_reply
         if request["request"] == "view":
             version = request["version"]
             epoch = f"{bytes(version['group']).hex()}@{version['epoch']}"
@@ -762,6 +863,89 @@ class ModePolicyTest(unittest.TestCase):
         old = self.snapshot()
         self.active = frozenset([self.versions[0], self.versions[3]])
         self.controller.reconcile(old, self.snapshot)
+        self.assertEqual(self.requests, [])
+
+    def configure_provision(self):
+        groups = []
+        for group in self.groups[1:3]:
+            deployment = self.policy.with_name(f"{group}.json")
+            deployment.write_text(json.dumps(native_deployment(group, group, 8100)))
+            groups.append({"deployment": deployment.name, "workload": {"widths": [1]}})
+        self.config["provision"] = [
+            {
+                "groups": groups,
+                "devices": 2,
+                "slo_profile": {"rps": 15, "valid_until_ms": 60_000},
+            }
+        ]
+        self.incumbent = self.config["modes"][0]
+        self.target = self.config["modes"][1]
+        self.config["modes"] = [self.incumbent]
+        self.policy.write_text(json.dumps(self.config))
+
+    def test_provisions_as_a_set_and_switches_after_exact_profile_and_readiness(self):
+        self.configure_provision()
+        self.ready.clear()
+        self.plan_reply = {
+            "decision": "prepare_set",
+            "result": {
+                "Ok": {
+                    "PreparedSet": [
+                        {"group": list(bytes.fromhex(group)), "epoch": 1}
+                        for group in self.groups[1:3]
+                    ]
+                }
+            },
+        }
+        self.may_lose_reply = True
+        self.sample(0, seconds=0)
+        self.sample(12)
+        self.assertEqual(self.plans, [])
+        self.sample(12)
+        self.assertEqual(len(self.plans), 2)
+        self.assertEqual(self.plans[0], self.plans[1])
+        plan = self.plans[0]
+        self.assertEqual(
+            plan["guards"],
+            [
+                [list(bytes.fromhex(group)), 1 if index == 0 else None]
+                for index, group in enumerate(self.groups)
+            ],
+        )
+        self.assertEqual(
+            [
+                (bytes(member["group"]).hex(), bytes(member["hosts"][0]).hex())
+                for member in plan["groups"]
+            ],
+            [(group, group) for group in self.groups[1:3]],
+        )
+
+        self.ready.update(self.versions[1:3])
+        self.sample(12)
+        self.assertEqual(self.requests, [])
+        self.config["modes"].append(self.target)
+        self.policy.write_text(json.dumps(self.config))
+        self.ready.remove(self.versions[2])
+        self.sample(12)
+        self.sample(12)
+        self.sample(12)
+        self.assertEqual(self.requests, [])
+        self.ready.add(self.versions[2])
+        self.sample(12)
+        self.sample(12)
+        self.assertEqual(len(self.requests), 1)
+        self.assertEqual(
+            [change["target"] for change in self.changes()], [None, 1, 1, None]
+        )
+
+    def test_expired_projection_preserves_incumbent_without_reserving(self):
+        self.configure_provision()
+        self.config["provision"][0]["slo_profile"]["valid_until_ms"] = 2000
+        self.policy.write_text(json.dumps(self.config))
+        self.sample(0, seconds=0)
+        self.sample(12)
+        self.sample(12)
+        self.assertEqual(self.plans, [])
         self.assertEqual(self.requests, [])
 
 

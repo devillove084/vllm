@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Select a ready aggregate, P/D, or mixed layout from measured capacity."""
+"""Prepare and select native serving layouts from workload and capacity."""
 
 import json
 import math
@@ -10,6 +10,8 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+
+from vllm.entrypoints.serve.plait_deploy import Deployment
 
 from .group import (
     DIRECTORY_POLL_SECONDS,
@@ -21,6 +23,7 @@ from .group import (
 from .load import Load
 
 VERSION = re.compile(r"[a-f0-9]{32}@[1-9][0-9]*")
+GROUP_ID = re.compile(r"[a-f0-9]{32}")
 
 
 @dataclass(frozen=True)
@@ -33,26 +36,87 @@ class Capacity:
     @classmethod
     def read(cls, profile: dict) -> "Capacity":
         versions = profile["versions"]
-        devices = profile["devices"]
-        slo = profile["slo_profile"]
-        valid_until_ms = slo["valid_until_ms"]
         if (
             not isinstance(versions, list)
             or not versions
             or any(not isinstance(v, str) or not VERSION.fullmatch(v) for v in versions)
             or len({v.split("@", 1)[0] for v in versions}) != len(versions)
-            or type(devices) is not int
-            or devices < len(versions)
-            or type(valid_until_ms) is not int
-            or valid_until_ms <= 0
         ):
             raise ValueError("invalid versioned SLO profile")
+        return cls(frozenset(versions), *profile_limits(profile, len(versions)))
+
+
+def profile_limits(profile: dict, groups: int) -> tuple[int, float, int]:
+    slo = profile["slo_profile"]
+    devices = profile["devices"]
+    expires = slo["valid_until_ms"]
+    if (
+        type(devices) is not int
+        or devices < groups
+        or type(expires) is not int
+        or expires <= 0
+    ):
+        raise ValueError("invalid device count or lifetime in SLO profile")
+    return devices, number(slo["rps"], positive=True), expires
+
+
+def group_id(text: str) -> str:
+    if not isinstance(text, str) or not GROUP_ID.fullmatch(text):
+        raise ValueError("expected a lowercase 32-digit Plait identity")
+    return text
+
+
+@dataclass(frozen=True)
+class PlanMember:
+    group: str
+    hosts: tuple[str, ...]
+    workload: dict
+    calibration: str | None
+
+    @classmethod
+    def read(cls, item: dict, parent: Path, model: str | None) -> "PlanMember":
+        deployment = Deployment.read(parent / item["deployment"])
+        workload = item["workload"]
+        if not isinstance(workload, dict) or (
+            model is not None and deployment.model_alias != model
+        ):
+            raise ValueError("invalid provision workload or deployment")
+        calibration = item.get("calibration")
         return cls(
-            frozenset(versions),
-            devices,
-            number(slo["rps"], positive=True),
-            valid_until_ms,
+            deployment.group_id,
+            tuple(sorted(deployment.hosts)),
+            workload,
+            group_id(calibration) if calibration is not None else None,
         )
+
+    def request(self) -> dict:
+        return {
+            "group": list(bytes.fromhex(self.group)),
+            "workload": self.workload,
+            "hosts": [list(bytes.fromhex(host)) for host in self.hosts],
+            "calibration": (
+                list(bytes.fromhex(self.calibration))
+                if self.calibration is not None
+                else None
+            ),
+        }
+
+
+@dataclass(frozen=True)
+class Provision:
+    members: tuple[PlanMember, ...]
+    devices: int
+    rps: float
+    valid_until_ms: int
+
+    @classmethod
+    def read(cls, profile: dict, parent: Path, model: str | None) -> "Provision":
+        members = tuple(
+            PlanMember.read(item, parent, model) for item in profile["groups"]
+        )
+        if not members or len({member.group for member in members}) != len(members):
+            raise ValueError("provision needs unique execution groups")
+        return cls(members, *profile_limits(profile, len(members)))
 
 
 def number(value: object, *, positive: bool = False) -> float:
@@ -77,13 +141,18 @@ class Policy:
     switch_loss_requests: float
     minimum_gain_requests: float
     modes: tuple[Capacity, ...]
+    provision: tuple[Provision, ...]
 
     @classmethod
-    def read(cls, path: Path) -> "Policy":
+    def read(cls, path: Path, model: str | None = None) -> "Policy":
         config = json.loads(path.read_text(encoding="utf-8"))
         revision = config["route_revision"]
         stable = config["stable_windows"]
         modes = tuple(Capacity.read(profile) for profile in config["modes"])
+        provision = tuple(
+            Provision.read(profile, path.parent, model)
+            for profile in config.get("provision", [])
+        )
         if (
             type(revision) is not int
             or revision < 1
@@ -103,10 +172,13 @@ class Policy:
             number(config["switch_loss_requests"]),
             number(config["minimum_gain_requests"]),
             modes,
+            provision,
         )
 
 
-def gain(policy: Policy, incumbent: Capacity, target: Capacity, demand: float) -> float:
+def gain(
+    policy: Policy, incumbent: Capacity, target: Capacity | Provision, demand: float
+) -> float:
     baseline = min(demand, incumbent.rps)
     served = min(demand, target.rps)
     if served < baseline:
@@ -145,13 +217,16 @@ class ModeView:
 
 
 class ModeController:
-    def __init__(self, policy: Path, load: Load, control: Control):
+    def __init__(
+        self, policy: Path, load: Load, control: Control, model: str | None = None
+    ):
         self.path = policy
         self.load = load
         self.control = control
+        self.model = model
         self.previous: dict | None = None
         self.last_policy: Policy | None = None
-        self.proposal: tuple[Capacity, Capacity] | None = None
+        self.proposal: tuple[Capacity, Capacity | Provision] | None = None
         self.windows = 0
         self.cooldown_until = 0.0
 
@@ -212,7 +287,7 @@ class ModeController:
         self, view: ModeView, snapshot: Callable[[], ModeView | None]
     ) -> None:
         routes, active = view.routes, view.active
-        policy = Policy.read(self.path)
+        policy = Policy.read(self.path, self.model)
         if policy != self.last_policy:
             self.last_policy = policy
             self.reset_evidence()
@@ -242,7 +317,7 @@ class ModeController:
             ),
             key=lambda item: (-item[0], item[1].devices, sorted(item[1].versions)),
         )
-        chosen = next(
+        chosen: tuple[float, Capacity | Provision] | None = next(
             (
                 (score, mode)
                 for score, mode in candidates
@@ -253,6 +328,23 @@ class ModeController:
             ),
             None,
         )
+        if chosen is None:
+            projections = (
+                (gain(policy, incumbent, target, demand), target)
+                for target in policy.provision
+                if target.valid_until_ms > now_ms
+            )
+            chosen = max(
+                (
+                    (score, target)
+                    for score, target in projections
+                    if math.isfinite(score)
+                    and score > 0
+                    and score >= policy.minimum_gain_requests
+                ),
+                key=lambda item: item[0],
+                default=None,
+            )
         proposal = (incumbent, chosen[1]) if chosen is not None else None
         self.windows = self.windows + 1 if proposal == self.proposal else 1
         self.proposal = proposal
@@ -262,22 +354,58 @@ class ModeController:
         if (
             not self.ready(incumbent, routes, active, verify_http=False)
             or snapshot() != view
-            or Policy.read(self.path) != policy
+            or Policy.read(self.path, self.model) != policy
             or min(incumbent.valid_until_ms, target.valid_until_ms)
             <= time.time_ns() // 1_000_000
         ):
             self.proposal = None
             self.windows = 0
             return
-        self.switch(view.groups, active, target.versions)
-        self.cooldown_until = time.monotonic() + policy.cooldown_seconds
+        if isinstance(target, Provision):
+            if self.prepare(view, target):
+                print(
+                    f"Plait prepared a candidate layout at {demand:.2f} requests/s",
+                    flush=True,
+                )
+        else:
+            self.switch(view.groups, active, target.versions)
+            self.cooldown_until = time.monotonic() + policy.cooldown_seconds
+            print(
+                f"Plait serving mode switched at {demand:.2f} requests/s "
+                f"with projected gain {score:.2f} requests",
+                flush=True,
+            )
         self.proposal = None
         self.windows = 0
-        print(
-            f"Plait serving mode switched at {demand:.2f} requests/s "
-            f"with projected gain {score:.2f} requests",
-            flush=True,
-        )
+
+    def prepare(self, view: ModeView, target: Provision) -> bool:
+        incumbent = active_epochs(view.active)
+        targets = [member.group for member in target.members]
+        guarded = sorted(set(view.groups).union(targets))
+        request = {
+            "request": "plan_set",
+            "prepare": self.control.next_operation_id(),
+            "guards": [
+                [list(bytes.fromhex(group)), incumbent.get(group)] for group in guarded
+            ],
+            "groups": [member.request() for member in target.members],
+        }
+        try:
+            response = self.control.request(request)
+        except ControlError:
+            response = self.control.request(request)
+        if response["decision"] in ("pending", "no_placement"):
+            return False
+        result = response["result"]
+        if "Ok" not in result:
+            raise ControlError(f"Plait layout preparation rejected: {result['Err']}")
+        versions = result["Ok"]["PreparedSet"]
+        if [bytes(version["group"]).hex() for version in versions] != targets or any(
+            type(version["epoch"]) is not int or version["epoch"] < 1
+            for version in versions
+        ):
+            raise ControlError("Plait returned a different candidate set")
+        return True
 
     def ready(
         self,
@@ -305,16 +433,8 @@ class ModeController:
     def switch(
         self, groups: tuple[str, ...], active: frozenset[str], target: frozenset[str]
     ) -> None:
-        expected = {
-            group: int(epoch)
-            for version in active
-            for group, epoch in (version.split("@", 1),)
-        }
-        replacement = {
-            group: int(epoch)
-            for version in target
-            for group, epoch in (version.split("@", 1),)
-        }
+        expected = active_epochs(active)
+        replacement = active_epochs(target)
         request = {
             "request": "apply",
             "operation": {
@@ -343,3 +463,11 @@ class ModeController:
             [list(bytes.fromhex(group)), replacement.get(group)] for group in groups
         ]:
             raise ControlError("Plait returned a different active set after switching")
+
+
+def active_epochs(versions: frozenset[str]) -> dict[str, int]:
+    return {
+        group: int(epoch)
+        for version in versions
+        for group, epoch in (version.split("@", 1),)
+    }

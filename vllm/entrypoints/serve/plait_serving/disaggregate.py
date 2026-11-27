@@ -20,6 +20,7 @@ from dataclasses import dataclass, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from .bindings import Bindings
 from .group import (
     DIRECTORY_POLL_SECONDS,
     DIRECTORY_READ_TTL,
@@ -193,6 +194,7 @@ class NativeDirectory(ControlDirectory):
         self.path = path
         self.mode_view: ModeView | None = None
         self.configured: list[Destination] = []
+        self.discovery: dict = {}
 
     def refresh(self) -> None:
         document = json.loads(self.path.read_text(encoding="utf-8"))
@@ -202,33 +204,40 @@ class NativeDirectory(ControlDirectory):
             raise ValueError("unexpected native route directory")
         if revision < self.revision:
             return
-        if revision == self.revision and paths != self.configured:
+        discovery = document.get("discover", {})
+        if revision == self.revision and (
+            paths != self.configured or discovery != self.discovery
+        ):
             raise ValueError("native route changes require a new revision")
-
+        dynamic = Bindings.read(self.model, self.path.parent, discovery)
+        static_groups = {
+            endpoint.version.split("@", 1)[0]
+            for path in paths
+            for endpoint in (
+                (path.prefill, path.decode) if isinstance(path, Route) else (path,)
+            )
+        }
+        if static_groups & dynamic.deployments.keys():
+            raise ValueError("use one native binding source per group")
+        groups = sorted(static_groups | dynamic.deployments.keys())
+        sent = time.monotonic()
+        active = frozenset(self.observe(groups)) if groups else frozenset()
+        _, discovered = parse_directory(dynamic.resolve(self.control, active))
+        configured = list(dict.fromkeys(paths + discovered))
         bindings = tuple(
             (path.prefill, path.decode) if isinstance(path, Route) else (path,)
-            for path in paths
+            for path in configured
         )
-        groups = sorted(
-            {
-                endpoint.version.split("@", 1)[0]
-                for endpoints in bindings
-                for endpoint in endpoints
-            }
-        )
-        sent = time.monotonic()
-        active = self.observe(groups) if groups else set()
         with self.lock:
             self.revision = revision
             self.configured = paths
+            self.discovery = discovery
             self.paths = [
                 replace(path, prefill_lease=False) if isinstance(path, Route) else path
-                for path, endpoints in zip(paths, bindings)
+                for path, endpoints in zip(configured, bindings)
                 if all(endpoint.version in active for endpoint in endpoints)
             ]
-            self.mode_view = ModeView(
-                revision, bindings, tuple(groups), frozenset(active)
-            )
+            self.mode_view = ModeView(revision, bindings, tuple(groups), active)
             self.until = sent + DIRECTORY_READ_TTL
 
     def mode_snapshot(self) -> ModeView | None:
@@ -849,7 +858,7 @@ def main() -> None:
     parser.add_argument(
         "--mode-policy",
         type=Path,
-        help="switch native layouts using measured SLO capacity",
+        help="prepare and switch native layouts using serving capacity profiles",
     )
     parser.add_argument("--timeout", type=float, default=120.0)
     args = parser.parse_args()
@@ -949,7 +958,9 @@ def route_source(args: argparse.Namespace, load: Load | None = None):
         and load is not None
     ):
         host, _, _port = args.control_listen.rpartition(":")
-        controller = ModeController(args.mode_policy, load, control(f"{host}:0"))
+        controller = ModeController(
+            args.mode_policy, load, control(f"{host}:0"), args.model
+        )
         threads.append(
             threading.Thread(
                 target=controller.watch,
