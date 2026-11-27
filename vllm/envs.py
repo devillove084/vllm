@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     VLLM_PLAIT_PROMPT_LOGPROBS_OVERLAP: bool = False
     VLLM_PLAIT_SHARDED_PROMPT_LOGPROBS: bool = False
     VLLM_PLAIT_TP_GROUP_CONFIG: str | None = None
+    VLLM_PLAIT_PEER_REPLICATED_EGRESS_BYTES: str | None = None
     VLLM_PLAIT_W4_LIBRARY: str | None = None
     VLLM_PLAIT_W4_ACTIVATION_BITS: int = 8
     LD_LIBRARY_PATH: str | None = None
@@ -759,6 +760,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_PLAIT_SHARDED_PROMPT_LOGPROBS", "0") == "1"
     ),
     "VLLM_PLAIT_TP_GROUP_CONFIG": lambda: os.getenv("VLLM_PLAIT_TP_GROUP_CONFIG"),
+    "VLLM_PLAIT_PEER_REPLICATED_EGRESS_BYTES": lambda: os.getenv(
+        "VLLM_PLAIT_PEER_REPLICATED_EGRESS_BYTES"
+    ),
     "VLLM_PLAIT_W4_LIBRARY": lambda: os.getenv("VLLM_PLAIT_W4_LIBRARY"),
     "VLLM_PLAIT_W4_ACTIVATION_BITS": lambda: int(
         os.getenv("VLLM_PLAIT_W4_ACTIVATION_BITS", "8")

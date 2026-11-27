@@ -625,6 +625,15 @@ def run(
             device_env = config["device_env"]
             child_env["VLLM_USE_PLAIT"] = "1"
             child_env["VLLM_HOST_IP"] = config["address"]
+            egress_env = "VLLM_PLAIT_PEER_REPLICATED_EGRESS_BYTES"
+            child_env.pop(egress_env, None)
+            egress = getattr(args, "replicated_egress_bytes", None)
+            if egress is not None:
+                if "VLLM_PLAIT_TP_GROUP_CONFIG" in child_env:
+                    raise ControlError(
+                        "hosted peer budget conflicts with a native group binding"
+                    )
+                child_env[egress_env] = str(egress)
             if release_driver is not None:
                 for transport in (
                     "PLAIT_NCCL_SHM",

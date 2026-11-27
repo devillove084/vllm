@@ -110,6 +110,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--resident-hosted", action="store_true", help=argparse.SUPPRESS
     )
+    parser.add_argument("--replicated-egress-bytes", type=int, help=argparse.SUPPRESS)
     parser.add_argument("--control-bin", default="plait-node")
     parser.add_argument("--control-peer", action="append", default=[])
     parser.add_argument("--control-seed", action="append", default=[])
@@ -129,6 +130,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--print-launch-digest", action="store_true")
     args = parser.parse_args()
+    if args.replicated_egress_bytes is not None and (
+        not args.resident_hosted or not 0 <= args.replicated_egress_bytes < 2**64
+    ):
+        parser.error("--replicated-egress-bytes requires a hosted unsigned byte limit")
     args.bootstrap = None
     args.hosted_block_size = None
     args.stream_checkpoints = False

@@ -100,6 +100,7 @@ class LaunchTest(unittest.TestCase):
             drain_timeout=1,
             verify_release=None,
             release_driver=monitor,
+            replicated_egress_bytes=0,
         )
         spec = {
             "api_host": host,
@@ -177,13 +178,20 @@ class LaunchTest(unittest.TestCase):
                 args,
                 ["vllm", "serve", "model"],
                 digest,
-                {"HIP_VISIBLE_DEVICES": "5"},
+                {
+                    "HIP_VISIBLE_DEVICES": "5",
+                    "VLLM_PLAIT_PEER_REPLICATED_EGRESS_BYTES": "393216",
+                },
                 lambda _: True,
                 lambda: False,
                 host_launch_spec=spec,
             )
         self.assertEqual(calls, ["capture-host-release", "verify-host-release"])
         self.assertEqual(process.call_args.kwargs["env"]["HIP_VISIBLE_DEVICES"], "1")
+        self.assertEqual(
+            process.call_args.kwargs["env"]["VLLM_PLAIT_PEER_REPLICATED_EGRESS_BYTES"],
+            "0",
+        )
         retire.assert_called_once()
 
     def test_backend_probe_accepts_a_drained_port_and_rejects_an_active_listener(self):

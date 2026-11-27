@@ -266,8 +266,12 @@ class PyNcclCommunicator:
                     dist.all_gather_object(members, local, group=peer_group)
                     return members
 
+                options = {}
+                egress = envs.VLLM_PLAIT_PEER_REPLICATED_EGRESS_BYTES
+                if egress is not None:
+                    options["replicated_egress_bytes"] = int(egress)
                 self.comm = self.nccl.connect_peers(
-                    get_ip(), self.rank, exchange_endpoints
+                    get_ip(), self.rank, exchange_endpoints, **options
                 )
 
             if _warmup_deferred():
