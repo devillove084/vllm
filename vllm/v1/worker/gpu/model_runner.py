@@ -2128,7 +2128,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if get_shard is not None:
                 logits_shard = get_shard()
         submit_logits_fn = None
-        if envs.VLLM_PLAIT_PROMPT_LOGPROBS_OVERLAP:
+        overlap_prompt_logprobs = envs.VLLM_PLAIT_PROMPT_LOGPROBS_OVERLAP
+        if overlap_prompt_logprobs:
             get_submitter = getattr(self.model, "prompt_logits_submitter", None)
             if get_submitter is not None:
                 submit_logits_fn = get_submitter()
@@ -2141,6 +2142,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.req_states.prompt_len.np,
             submit_logits_fn=submit_logits_fn,
             logits_shard=logits_shard,
+            overlap_sharded=overlap_prompt_logprobs,
         )
         prompt_token_id_logprobs_dict = (
             self.prompt_logprobs_worker.compute_prompt_token_id_logprobs(

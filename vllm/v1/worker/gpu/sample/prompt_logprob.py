@@ -18,7 +18,7 @@ from vllm.v1.worker.gpu.sample.logprob import (
     compute_topk_scores,
 )
 from vllm.v1.worker.gpu.sample.sharded_prompt_logprob import (
-    compute_sharded_prompt_scores,
+    prepare_sharded_prompt_scores,
 )
 
 if TYPE_CHECKING:
@@ -137,6 +137,7 @@ class PromptLogprobsWorker:
         submit_logits_fn: Callable[[torch.Tensor], Callable[[], torch.Tensor]]
         | None = None,
         logits_shard: "PromptLogitsShard | None" = None,
+        overlap_sharded: bool = False,
     ) -> dict[str, LogprobsTensors]:
         idx_mapping_np = input_batch.idx_mapping_np
         needs_prompt_logprobs = self.uses_prompt_logprobs[idx_mapping_np]
@@ -180,6 +181,7 @@ class PromptLogprobsWorker:
                 self.logprobs_mode,
                 submit_logits_fn=submit_logits_fn,
                 logits_shard=logits_shard,
+                overlap_sharded=overlap_sharded,
             )
         )
 
@@ -301,6 +303,7 @@ def compute_prompt_logprobs_with_chunking(
     submit_logits_fn: Callable[[torch.Tensor], Callable[[], torch.Tensor]]
     | None = None,
     logits_shard: "PromptLogitsShard | None" = None,
+    overlap_sharded: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     # Since materializing the full prompt logits can take too much memory,
     # we compute it in chunks.
@@ -321,18 +324,40 @@ def compute_prompt_logprobs_with_chunking(
         and num_rows > CHUNK_SIZE
         else None
     )
+    prepared_shard = None
     for start_idx in range(0, num_rows, CHUNK_SIZE):
         end_idx = start_idx + CHUNK_SIZE
         hidden = prompt_hidden_states[start_idx:end_idx]
         targets = prompt_token_ids[start_idx:end_idx]
         if logits_shard is not None:
-            result = compute_sharded_prompt_scores(
-                logits_shard,
-                hidden,
-                targets,
-                num_prompt_logprobs,
-                logits_mode=logits_mode,
+            if prepared_shard is None:
+                prepared_shard = prepare_sharded_prompt_scores(
+                    logits_shard,
+                    hidden,
+                    targets,
+                    num_prompt_logprobs,
+                    logits_mode=logits_mode,
+                )
+            wait_metadata = (
+                prepared_shard.try_submit_metadata()
+                if overlap_sharded and end_idx < num_rows
+                else None
             )
+            # Finish all collectives for this block before submitting the next
+            # block. Only local projection and packing can pass the wait.
+            next_shard = (
+                prepare_sharded_prompt_scores(
+                    logits_shard,
+                    prompt_hidden_states[end_idx : end_idx + CHUNK_SIZE],
+                    prompt_token_ids[end_idx : end_idx + CHUNK_SIZE],
+                    num_prompt_logprobs,
+                    logits_mode=logits_mode,
+                )
+                if wait_metadata is not None
+                else None
+            )
+            result = prepared_shard.finish(wait_metadata)
+            prepared_shard = next_shard
         else:
             if pending is None:
                 prompt_logits = logits_fn(hidden)

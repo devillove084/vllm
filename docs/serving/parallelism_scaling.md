@@ -185,6 +185,13 @@ the entire vocabulary use the dense path. Raw logits retain their
 projection precision. Normalized scores combine FP32 partial sums across
 shards. [TLA+ model](../../tools/plait/serving/specs/PlaitShardedPromptScores.tla)
 
+Set `VLLM_PLAIT_PROMPT_LOGPROBS_OVERLAP=1` on the same workers to overlap a
+sharded block's summary AllGather with the next block's local projection
+and packing. A worker that cannot submit the request completes that block
+through the blocking path. Each block completes its rank and fallback
+collectives before the next block issues any collective. The overlap can
+keep two local projections live on a device. [Overlap model](../../tools/plait/serving/specs/PlaitShardedPromptOverlap.tla)
+
 For disaggregated prefill, use `PlaitKvConnector` on both engines and a
 Plait KV store that supports `PLAITKV3` range requests. The two engines
 share a model namespace, logical KV block size and KV dtype. Each engine

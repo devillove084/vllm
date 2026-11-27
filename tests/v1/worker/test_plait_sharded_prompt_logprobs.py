@@ -7,7 +7,7 @@ import torch
 
 from vllm.model_executor.layers.logits_processor import PromptLogitsShard
 from vllm.v1.outputs import LogprobsTensors
-from vllm.v1.worker.gpu.sample import sharded_prompt_logprob
+from vllm.v1.worker.gpu.sample import prompt_logprob, sharded_prompt_logprob
 
 
 class _Collectives:
@@ -78,9 +78,9 @@ def test_sharded_prompt_scores_gather_only_tied_rows(monkeypatch):
                     shard_width=width,
                     first_token=start,
                 )
-                return sharded_prompt_logprob.compute_sharded_prompt_scores(
+                return sharded_prompt_logprob.prepare_sharded_prompt_scores(
                     shard, logits, targets, k, logits_mode=logits_mode
-                )
+                ).finish()
 
             with ThreadPoolExecutor(max_workers=world) as pool:
                 actual = list(pool.map(score, range(world)))
@@ -100,3 +100,90 @@ def test_sharded_prompt_scores_gather_only_tied_rows(monkeypatch):
             if k:
                 expected.append(("gather", (2, width), -1))
             assert collectives.history == expected
+
+
+def test_sharded_prompt_overlaps_local_projection_with_mixed_gather_modes(monkeypatch):
+    monkeypatch.setattr(prompt_logprob, "CHUNK_SIZE", 2)
+    monkeypatch.setattr(sharded_prompt_logprob, "compute_topk_scores", _dense_scores)
+    logits = torch.tensor(
+        [
+            [5, 8, 1, 2, 0, 6],
+            [10, 2, 3, 10, 4, 7],
+            [11, 7, 0, 2, 3, 6],
+            [3, 6, 7, 1, 8, 4],
+            [1, 1, 1, 1, 1, 1],
+        ],
+        dtype=torch.float16,
+    )
+    targets = torch.tensor([4, 1, 5, 2, 0])
+    rows = torch.arange(len(logits))
+    collectives = _Collectives(2)
+    events = []
+
+    class MixedCommunicator(_Communicator):
+        def try_all_gather(self, value, dim=-1):
+            if self.rank != 0:
+                return None
+            if ("submit", 0) in events:
+                events.append(("busy", 2))
+                return None
+            events.append(("submit", 0))
+            future = wire.submit(self.all_gather, value, dim)
+
+            def wait():
+                events.append(("wait", 0))
+                return future.result(timeout=10)
+
+            return wait
+
+    def score(rank):
+        def project(block):
+            if rank == 0:
+                events.append(("project", block[0].item()))
+            return logits[block, rank * 3 : (rank + 1) * 3]
+
+        shard = PromptLogitsShard(
+            project=project,
+            communicator=MixedCommunicator(collectives, rank),
+            vocab_size=6,
+            shard_width=3,
+            first_token=rank * 3,
+        )
+        return prompt_logprob.compute_prompt_logprobs_with_chunking(
+            targets,
+            rows,
+            project,
+            2,
+            "raw_logits",
+            logits_shard=shard,
+            overlap_sharded=True,
+        )
+
+    with (
+        ThreadPoolExecutor(max_workers=1) as wire,
+        ThreadPoolExecutor(max_workers=2) as pool,
+    ):
+        actual = list(pool.map(score, range(2)))
+
+    reference = _dense_scores(logits, 2, targets, logits_mode=True)
+    for token_ids, scores, ranks in actual:
+        torch.testing.assert_close(token_ids, reference.logprob_token_ids)
+        torch.testing.assert_close(scores, reference.logprobs)
+        torch.testing.assert_close(ranks, reference.selected_token_ranks)
+    assert events == [
+        ("project", 0),
+        ("submit", 0),
+        ("project", 2),
+        ("wait", 0),
+        ("busy", 2),
+        ("project", 4),
+    ]
+    assert collectives.history == [
+        ("gather", (2, 8), 0),
+        ("sum", (2,), 0),
+        ("gather", (1, 3), -1),
+        ("gather", (2, 8), 0),
+        ("sum", (2,), 0),
+        ("gather", (1, 8), 0),
+        ("gather", (1, 3), -1),
+    ]
