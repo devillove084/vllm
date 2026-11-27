@@ -349,6 +349,73 @@ def test_hisparse_derived_specs_do_not_affect_kv_cache_layout(monkeypatch):
     assert layouts[0] == layouts[1]
 
 
+@pytest.mark.parametrize("reverse_workers", [False, True])
+@pytest.mark.parametrize("override", [None, "LBHNC"])
+def test_plait_negotiates_a_shared_kv_cache_layout(
+    monkeypatch, reverse_workers, override
+):
+    from vllm.v1.attention.backends import utils
+
+    monkeypatch.setattr(utils.envs, "VLLM_USE_PLAIT", True)
+    monkeypatch.setattr(utils.envs, "VLLM_KV_CACHE_LAYOUT", override)
+    config = cast(
+        VllmConfig, SimpleNamespace(cache_config=CacheConfig(), kv_transfer_config=None)
+    )
+    layouts = [["LBNHC", "LBHNC", "BLNHC", "LHBNC"], ["LHBNC", "LBHNC"]]
+    if reverse_workers:
+        layouts.reverse()
+    selected = utils.resolve_kv_cache_layout(config, layouts)
+    assert selected.name == (override or "LHBNC")
+    assert config.cache_config.kv_cache_layout == selected.name
+
+
+@pytest.mark.parametrize(
+    ("layouts", "override", "message"),
+    [
+        ([["LBNHC"], ["LHBNC"]], None, "No KV cache layout"),
+        ([["LBNHC", "LHBNC"], ["LHBNC"]], "LBNHC", "does not satisfy every"),
+    ],
+)
+def test_plait_rejects_incompatible_kv_cache_layouts(
+    monkeypatch, layouts, override, message
+):
+    from vllm.v1.attention.backends import utils
+
+    monkeypatch.setattr(utils.envs, "VLLM_USE_PLAIT", True)
+    monkeypatch.setattr(utils.envs, "VLLM_KV_CACHE_LAYOUT", override)
+    config = cast(
+        VllmConfig, SimpleNamespace(cache_config=CacheConfig(), kv_transfer_config=None)
+    )
+    with pytest.raises(ValueError, match=message):
+        utils.resolve_kv_cache_layout(config, layouts)
+    assert config.cache_config.kv_cache_layout is None
+
+
+@pytest.mark.parametrize("reverse_workers", [False, True])
+def test_plait_keeps_worker_local_dense_kv_packing(monkeypatch, reverse_workers):
+    monkeypatch.setattr(kv_cache_utils.envs, "VLLM_USE_PLAIT", True)
+    config = VllmConfig(model_config=ModelConfig(max_model_len=64))
+    config.cache_config.kv_cache_layout = "LBHNC"
+    dense = FullAttentionSpec(
+        block_size=16, num_kv_heads=4, head_size=128, dtype=torch.float16
+    )
+    separated = replace(dense, num_head_slots=2, state_content_bytes=1024)
+    physical = [dense, separated]
+    if reverse_workers:
+        physical.reverse()
+    specs = [{"layer0": spec, "layer1": spec} for spec in physical]
+    workers = get_kv_cache_configs(config, specs, [1 << 23, 1 << 22])
+    assert workers[0].num_blocks == workers[1].num_blocks
+    assert [worker.kv_cache_groups[0].kv_cache_spec for worker in workers] == physical
+
+    different_heads = replace(dense, num_kv_heads=8, head_size=64, head_size_v=64)
+    assert different_heads.page_size_bytes == dense.page_size_bytes
+    with pytest.raises(AssertionError, match="specs for layer0 are different"):
+        get_kv_cache_configs(
+            config, [{"layer0": dense}, {"layer0": different_heads}], [1 << 23] * 2
+        )
+
+
 def test_hisparse_rejects_deepseek_v4():
     full_specs = {
         "model.layers.0.attn": MLAAttentionSpec(

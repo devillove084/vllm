@@ -38,6 +38,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheLayout,
     KVCacheSpec,
     KVCacheTensor,
+    KVQuantMode,
     MambaSpec,
     MLAAttentionSpec,
     SlidingWindowMLASpec,
@@ -2639,6 +2640,7 @@ def _auto_fit_max_model_len(
 def _project_kv_cache_groups_to_worker(
     global_kv_cache_groups: list[KVCacheGroupSpec],
     worker_spec: dict[str, KVCacheSpec],
+    local_packing: set[str] | None = None,
 ) -> list[KVCacheGroupSpec]:
     """Projects global KV cache groups onto a single worker's assigned layers.
 
@@ -2649,6 +2651,8 @@ def _project_kv_cache_groups_to_worker(
     Args:
         global_kv_cache_groups: The global KV cache groups for the whole model.
         worker_spec: The KV cache spec of each layer on this worker.
+        local_packing: Layers with equivalent dense pages but different
+            backend packing across workers.
 
     Returns:
         The projected KV cache groups containing only this worker's layers.
@@ -2659,6 +2663,19 @@ def _project_kv_cache_groups_to_worker(
         worker_layer_names = [
             layer_name for layer_name in group.layer_names if layer_name in worker_spec
         ]
+        if local_packing and not local_packing.isdisjoint(worker_layer_names):
+            physical = worker_spec[worker_layer_names[0]]
+            if _logical_dense_kv_spec(physical) != group.kv_cache_spec or any(
+                worker_spec[name] != physical for name in worker_layer_names[1:]
+            ):
+                raise ValueError(
+                    "A Plait KV cache group with worker-local packing requires "
+                    "one uniform dense page spec per worker."
+                )
+            projected_groups.append(
+                replace(group, layer_names=worker_layer_names, kv_cache_spec=physical)
+            )
+            continue
         if len(worker_layer_names) == len(group.layer_names):
             projected_groups.append(group)
             continue
@@ -2679,6 +2696,20 @@ def _project_kv_cache_groups_to_worker(
             )
         )
     return projected_groups
+
+
+def _logical_dense_kv_spec(spec: KVCacheSpec) -> FullAttentionSpec | None:
+    """Remove the storage-only packing fields from a dense full-attention page."""
+    if (
+        type(spec) is not FullAttentionSpec
+        or spec.kv_quant_mode != KVQuantMode.NONE
+        or spec.tokens_per_state != 1
+    ):
+        return None
+    logical = replace(spec, num_head_slots=None, state_content_bytes=None)
+    if logical.unpadded_page_size_bytes != spec.unpadded_page_size_bytes:
+        return None
+    return logical
 
 
 def get_kv_cache_configs(
@@ -2717,17 +2748,29 @@ def get_kv_cache_configs(
     """
     # Merge the KV cache specs of all workers. Different PP stages may have
     # different layer names, and different TP ranks of the same PP stage should
-    # have the same KV cache spec.
+    # share the logical page geometry. A local Plait engine can keep equivalent
+    # dense pages in the packing required by each attention backend.
+    allow_local_packing = envs.VLLM_USE_PLAIT and vllm_config.kv_transfer_config is None
+    local_packing: set[str] = set()
     merged_kv_cache_specs: dict[str, KVCacheSpec] = {}
     for kv_cache_spec_one_worker in kv_cache_specs:
         for layer_name, layer_spec in kv_cache_spec_one_worker.items():
             if layer_name not in merged_kv_cache_specs:
                 merged_kv_cache_specs[layer_name] = layer_spec
-            else:
-                assert merged_kv_cache_specs[layer_name] == layer_spec, (
-                    "The KV cache specs for the same layer are different "
-                    "across workers. This is not supported yet."
-                )
+                continue
+            previous = merged_kv_cache_specs[layer_name]
+            if previous == layer_spec:
+                continue
+            if allow_local_packing:
+                logical = _logical_dense_kv_spec(layer_spec)
+                if logical is not None and logical == _logical_dense_kv_spec(previous):
+                    merged_kv_cache_specs[layer_name] = logical
+                    local_packing.add(layer_name)
+                    continue
+            raise AssertionError(
+                f"The KV cache specs for {layer_name} are different across workers: "
+                f"{previous!r} versus {layer_spec!r}."
+            )
 
     # Check if the KV cache specs are registered correctly.
     # This is to prevent that some layers are initialized with unregistered specs.
@@ -2751,7 +2794,9 @@ def get_kv_cache_configs(
     # determine the maximum model length that fits in available GPU memory.
     # We use per-worker projected groups to account for PP sharding.
     projected_groups_per_worker = [
-        _project_kv_cache_groups_to_worker(global_kv_cache_groups, worker_spec)
+        _project_kv_cache_groups_to_worker(
+            global_kv_cache_groups, worker_spec, local_packing
+        )
         for worker_spec in kv_cache_specs
     ]
 

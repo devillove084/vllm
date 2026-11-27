@@ -217,29 +217,34 @@ def get_supported_kv_cache_layouts(
     their order; otherwise the layout the most backends put first wins, ties
     keeping the enum order. An empty intersection is a hard error.
     """
-    supported_layouts_lists: list[Sequence[KVCacheLayout]] = [
+    supported_layouts: list[Sequence[KVCacheLayout]] = [
         layouts
         for backend in backends
         if (layouts := backend.supported_kv_cache_layouts()) is not None
     ] or [_DEFAULT_LAYOUT_PREFERENCE]
+    return _common_kv_cache_layouts(supported_layouts)
 
-    first = supported_layouts_lists[0]
-    if all(layouts == first for layouts in supported_layouts_lists[1:]):
+
+def _common_kv_cache_layouts(
+    supported_layouts: Sequence[Sequence[KVCacheLayout]],
+) -> list[KVCacheLayout]:
+    first = supported_layouts[0]
+    if all(layouts == first for layouts in supported_layouts[1:]):
         return list(first)
 
     priorities: dict[KVCacheLayout, int] = defaultdict(int)
-    for preferred_layout, *_ in supported_layouts_lists:
+    for preferred_layout, *_ in supported_layouts:
         priorities[preferred_layout] += 1
-    supported_layouts = set.intersection(*map(set, supported_layouts_lists))
+    common = set.intersection(*map(set, supported_layouts))
     candidates = sorted(
-        (layout for layout in KVCacheLayout if layout in supported_layouts),
+        (layout for layout in KVCacheLayout if layout in common),
         key=lambda layout: priorities[layout],
         reverse=True,
     )
     if not candidates:
         raise ValueError(
             "No KV cache layout satisfies every supported set: "
-            f"{list(map(_layout_names, supported_layouts_lists))}."
+            f"{list(map(_layout_names, supported_layouts))}."
         )
     return candidates
 
@@ -264,9 +269,11 @@ def resolve_kv_cache_layout(
     """Resolve one KV cache layout for the whole model.
 
     Runs once in the engine core. Every worker reports the layouts its backends
-    support, most preferred first (``get_supported_kv_cache_layouts``); all
-    ranks run the same backends, so their lists must agree. Specs mixing HNC
-    shapes narrow the candidates to block-compact layouts. An explicit
+    support, most preferred first (``get_supported_kv_cache_layouts``). Plait
+    workers can use different backends, so intersect their supported sets
+    and rank the common layouts by preference. Other executors require
+    identical lists. Specs mixing HNC shapes narrow the candidates to
+    block-compact layouts. An explicit
     ``VLLM_KV_CACHE_LAYOUT`` must be one of the candidates or resolution fails,
     with the legacy ``NHD``/``HND`` names as aliases for ``LBNHC``/``LBHNC``; the
     connector's preference is used when compatible and dropped with a warning
@@ -282,10 +289,15 @@ def resolve_kv_cache_layout(
     assert supported_layouts and all(supported_layouts), (
         "No worker reported supported KV cache layouts."
     )
-    assert all(names == supported_layouts[0] for names in supported_layouts[1:]), (
-        f"Workers disagree on supported KV cache layouts: {supported_layouts}."
-    )
-    candidates = [_layout_from_name(name) for name in supported_layouts[0]]
+    if envs.VLLM_USE_PLAIT:
+        candidates = _common_kv_cache_layouts(
+            [[_layout_from_name(name) for name in names] for names in supported_layouts]
+        )
+    else:
+        assert all(names == supported_layouts[0] for names in supported_layouts[1:]), (
+            f"Workers disagree on supported KV cache layouts: {supported_layouts}."
+        )
+        candidates = [_layout_from_name(name) for name in supported_layouts[0]]
 
     # A block-compact layout means the block is densely packed in memory, so any mix of
     # specs can re-interpret HNC with different sizes as long as the total number of
