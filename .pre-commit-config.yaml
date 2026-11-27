@@ -237,6 +237,8 @@ repos:
     entry: python tools/pre_commit/check_spdx_header.py
     language: python
     types_or: [python, rust, proto]
+    # The imported Plait modules carry their original MIT license.
+    exclude: ^(vllm/entrypoints/serve/plait_serving/|tests/entrypoints/serve/test_plait_serving_(pd|replay)\.py$)
   - id: check-root-lazy-imports
     name: Check root lazy imports
     entry: python tools/pre_commit/check_init_lazy_imports.py
