@@ -2122,6 +2122,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
 
         assert self.prompt_logprobs_worker is not None
+        submit_logits_fn = None
+        if envs.VLLM_PLAIT_PROMPT_LOGPROBS_OVERLAP:
+            get_submitter = getattr(self.model, "prompt_logits_submitter", None)
+            if get_submitter is not None:
+                submit_logits_fn = get_submitter()
         prompt_logprobs_dict = self.prompt_logprobs_worker.compute_prompt_logprobs(
             self.model.compute_logits,
             hidden_states,
@@ -2129,6 +2134,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.req_states.all_token_ids.gpu,
             self.req_states.num_computed_tokens.gpu,
             self.req_states.prompt_len.np,
+            submit_logits_fn=submit_logits_fn,
         )
         prompt_token_id_logprobs_dict = (
             self.prompt_logprobs_worker.compute_prompt_token_id_logprobs(

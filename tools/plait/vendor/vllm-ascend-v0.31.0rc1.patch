@@ -55,3 +55,15 @@ index f5dd4d4..0a3e373 100644
 +if not vllm_envs.VLLM_USE_PLAIT:
 +    vllm.distributed.parallel_state.GroupCoordinator = GroupCoordinatorPatch
 +    _patch_destroy_distributed_environment()
+diff --git a/vllm_ascend/ops/vocab_parallel_embedding.py b/vllm_ascend/ops/vocab_parallel_embedding.py
+--- a/vllm_ascend/ops/vocab_parallel_embedding.py
++++ b/vllm_ascend/ops/vocab_parallel_embedding.py
+@@ -549,3 +549,8 @@ class AscendLogitsProcessor(LogitsProcessor):
++    def prompt_logits_submitter(self, lm_head: AscendParallelLMHead):
++        if lm_head.parallel_mode is not VocabParallelMode.STANDARD:
++            return None
++        return self._standard_tp_prompt_logits_submitter(lm_head)
++
+     def _apply_head(
+         self,
+         lm_head: AscendParallelLMHead,

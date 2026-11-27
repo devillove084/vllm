@@ -126,6 +126,9 @@ class PromptLogprobsWorker:
         num_computed_tokens: torch.Tensor,
         # [max_num_reqs]
         prompt_lens: np.ndarray,
+        *,
+        submit_logits_fn: Callable[[torch.Tensor], Callable[[], torch.Tensor]]
+        | None = None,
     ) -> dict[str, LogprobsTensors]:
         idx_mapping_np = input_batch.idx_mapping_np
         needs_prompt_logprobs = self.uses_prompt_logprobs[idx_mapping_np]
@@ -167,6 +170,7 @@ class PromptLogprobsWorker:
                 logits_fn,
                 max_num_prompt_logprobs,
                 self.logprobs_mode,
+                submit_logits_fn=submit_logits_fn,
             )
         )
 
@@ -284,6 +288,9 @@ def compute_prompt_logprobs_with_chunking(
     logits_fn: Callable[[torch.Tensor], torch.Tensor],
     num_prompt_logprobs: int,
     logprobs_mode: LogprobsMode = "raw_logprobs",
+    *,
+    submit_logits_fn: Callable[[torch.Tensor], Callable[[], torch.Tensor]]
+    | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     # Since materializing the full prompt logits can take too much memory,
     # we compute it in chunks.
@@ -292,10 +299,25 @@ def compute_prompt_logprobs_with_chunking(
     ranks = []
     logits_mode = logprobs_mode in ("raw_logits", "processed_logits")
     prompt_token_ids = prompt_token_ids.to(torch.int64)
-    for start_idx in range(0, prompt_token_ids.shape[0], CHUNK_SIZE):
+    num_rows = prompt_token_ids.shape[0]
+    pending = (
+        submit_logits_fn(prompt_hidden_states[:CHUNK_SIZE])
+        if submit_logits_fn is not None and num_rows > CHUNK_SIZE
+        else None
+    )
+    for start_idx in range(0, num_rows, CHUNK_SIZE):
         end_idx = start_idx + CHUNK_SIZE
-        # NOTE(woosuk): logits_fn can be slow because it involves all-gather.
-        prompt_logits = logits_fn(prompt_hidden_states[start_idx:end_idx])
+        if pending is None:
+            prompt_logits = logits_fn(prompt_hidden_states[start_idx:end_idx])
+        else:
+            assert submit_logits_fn is not None
+            wait = pending
+            pending = (
+                submit_logits_fn(prompt_hidden_states[end_idx : end_idx + CHUNK_SIZE])
+                if end_idx < num_rows
+                else None
+            )
+            prompt_logits = wait()
         requested_num = (
             prompt_logits.shape[-1]
             if num_prompt_logprobs == -1

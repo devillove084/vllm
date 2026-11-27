@@ -109,15 +109,58 @@ class LogitsProcessor(PluggableLayer):
             logits = self._get_logits(
                 hidden_states, lm_head, embedding_bias, skip_gather
             )
-        if logits is not None:
-            if self.soft_cap is not None:
-                logits = logits / self.soft_cap
-                logits = torch.tanh(logits)
-                logits = logits * self.soft_cap
+        return None if logits is None else self._transform_logits(logits)
 
-            if self.scale != 1.0:
-                logits *= self.scale
+    def _transform_logits(self, logits: torch.Tensor) -> torch.Tensor:
+        if self.soft_cap is not None:
+            logits = logits / self.soft_cap
+            logits = torch.tanh(logits)
+            logits = logits * self.soft_cap
+        if self.scale != 1.0:
+            logits *= self.scale
         return logits
+
+    def prompt_logits_submitter(
+        self, lm_head: VocabParallelEmbedding
+    ) -> Callable[[torch.Tensor], Callable[[], torch.Tensor]] | None:
+        if type(self) is not LogitsProcessor:
+            return None
+        return self._standard_tp_prompt_logits_submitter(lm_head)
+
+    def _standard_tp_prompt_logits_submitter(
+        self, lm_head: VocabParallelEmbedding
+    ) -> Callable[[torch.Tensor], Callable[[], torch.Tensor]] | None:
+        from vllm.distributed.device_communicators.plait_communicator import (
+            PlaitCommunicator,
+        )
+        from vllm.distributed.parallel_state import get_tp_group
+
+        if self.logits_as_input or lm_head.tp_size <= 1 or not self.use_all_gather:
+            return None
+        comm = get_tp_group().device_communicator
+        if (
+            not isinstance(comm, PlaitCommunicator)
+            or not comm.supports_all_gather_requests
+        ):
+            return None
+
+        def submit(hidden_states: torch.Tensor) -> Callable[[], torch.Tensor]:
+            local = self._apply_head(lm_head, hidden_states, None)
+            gather = comm.try_all_gather(local)
+            if gather is None:
+                # A busy queue has not allocated a sequence for this gather.
+                # Run the same operation through the blocking entry point.
+                gathered = comm.all_gather(local)
+                return lambda: self._transform_logits(
+                    gathered[..., : self.org_vocab_size]
+                )
+
+            def finish() -> torch.Tensor:
+                return self._transform_logits(gather()[..., : self.org_vocab_size])
+
+            return finish
+
+        return submit
 
     def _gather_logits(self, logits: torch.Tensor) -> torch.Tensor:
         """gather/all-gather the logits tensor across model parallel group."""

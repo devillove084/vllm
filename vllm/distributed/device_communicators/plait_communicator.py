@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from collections.abc import Callable
+
 import torch
 from torch.distributed import ProcessGroup
 
@@ -68,6 +70,27 @@ class PlaitCommunicator(DeviceCommunicatorBase):
         self.pynccl_comm.all_gather(shards, input_.contiguous())
         dim %= input_.dim()
         return shards.movedim(0, dim).flatten(dim, dim + 1)
+
+    @property
+    def supports_all_gather_requests(self) -> bool:
+        return self.pynccl_comm.supports_all_gather_requests
+
+    def try_all_gather(
+        self, input_: torch.Tensor, dim: int = -1
+    ) -> Callable[[], torch.Tensor] | None:
+        gather = self.pynccl_comm.try_all_gather(input_.contiguous())
+        if gather is None:
+            return None
+        dim %= input_.dim()
+        shape = (self.world_size, *input_.shape)
+        dtype = input_.dtype
+
+        def wait() -> torch.Tensor:
+            shards = torch.empty(shape, dtype=dtype, device=self.device)
+            gather(shards)
+            return shards.movedim(0, dim).flatten(dim, dim + 1)
+
+        return wait
 
     def gather(
         self, input_: torch.Tensor, dst: int = 0, dim: int = -1

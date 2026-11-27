@@ -5,6 +5,7 @@
 # ===================== import region =====================
 import contextlib
 import threading
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import torch
@@ -402,6 +403,39 @@ class PyNcclCommunicator:
             self.comm,
             _stream_pointer(stream),
         )
+
+    @property
+    def supports_all_gather_requests(self) -> bool:
+        return not self.disabled and getattr(
+            self.comm, "supports_all_gather_requests", False
+        )
+
+    def try_all_gather(
+        self,
+        input_tensor: torch.Tensor,
+    ) -> Callable[[torch.Tensor], None] | None:
+        if not self.supports_all_gather_requests:
+            return None
+        assert input_tensor.device == self.device and input_tensor.is_contiguous()
+        dtype = ncclDataTypeEnum.from_torch(input_tensor.dtype)
+        request = self.comm.try_all_gather(
+            input_tensor.data_ptr(),
+            input_tensor.numel(),
+            dtype,
+            _stream_pointer(self._current_stream()).value or 0,
+        )
+        if request is None:
+            return None
+
+        def wait(output: torch.Tensor) -> None:
+            assert output.device == self.device and output.is_contiguous()
+            request.wait(
+                output.data_ptr(),
+                output.nbytes,
+                _stream_pointer(self._current_stream()).value or 0,
+            )
+
+        return wait
 
     def all_gatherv(
         self,

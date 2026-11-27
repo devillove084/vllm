@@ -23,7 +23,7 @@
 # limitations under the License.
 """Inference-only Qwen3 model compatible with HuggingFace weights."""
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import Any
 
 import torch
@@ -334,6 +334,11 @@ class Qwen3ForCausalLM(
     ) -> torch.Tensor | None:
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
+
+    def prompt_logits_submitter(
+        self,
+    ) -> Callable[[torch.Tensor], Callable[[], torch.Tensor]] | None:
+        return self.logits_processor.prompt_logits_submitter(self.lm_head)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
