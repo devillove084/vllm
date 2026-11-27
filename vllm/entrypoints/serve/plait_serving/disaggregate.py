@@ -39,6 +39,7 @@ from .launch import SEEDED_KV_RESUME
 from .load import Load
 from .load import listen as load_listener
 from .load import parse_address as parse_load_address
+from .mode import ModeController, ModeView
 from .replay import (
     RECOVERY_HEADER,
     RECOVERY_MODE,
@@ -190,6 +191,7 @@ class NativeDirectory(ControlDirectory):
     def __init__(self, model: str, control: Control, path: Path) -> None:
         super().__init__(model, control)
         self.path = path
+        self.mode_view: ModeView | None = None
         self.configured: list[Destination] = []
 
     def refresh(self) -> None:
@@ -203,20 +205,15 @@ class NativeDirectory(ControlDirectory):
         if revision == self.revision and paths != self.configured:
             raise ValueError("native route changes require a new revision")
 
-        bindings = [
-            (
-                path,
-                (path.prefill.version, path.decode.version)
-                if isinstance(path, Route)
-                else (path.version,),
-            )
+        bindings = tuple(
+            (path.prefill, path.decode) if isinstance(path, Route) else (path,)
             for path in paths
-        ]
+        )
         groups = sorted(
             {
-                version.split("@", 1)[0]
-                for _, required in bindings
-                for version in required
+                endpoint.version.split("@", 1)[0]
+                for endpoints in bindings
+                for endpoint in endpoints
             }
         )
         sent = time.monotonic()
@@ -226,10 +223,17 @@ class NativeDirectory(ControlDirectory):
             self.configured = paths
             self.paths = [
                 replace(path, prefill_lease=False) if isinstance(path, Route) else path
-                for path, required in bindings
-                if all(version in active for version in required)
+                for path, endpoints in zip(paths, bindings)
+                if all(endpoint.version in active for endpoint in endpoints)
             ]
+            self.mode_view = ModeView(
+                revision, bindings, tuple(groups), frozenset(active)
+            )
             self.until = sent + DIRECTORY_READ_TTL
+
+    def mode_snapshot(self) -> ModeView | None:
+        with self.lock:
+            return self.mode_view if time.monotonic() < self.until else None
 
     def observe(self, groups: list[str]) -> set[str]:
         result = self.control.request(
@@ -842,6 +846,11 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=8192)
     parser.add_argument("--kv-transport", choices=("nixl", "plait"))
     parser.add_argument("--load-listen", help="private IP:port for P/D demand counters")
+    parser.add_argument(
+        "--mode-policy",
+        type=Path,
+        help="switch native layouts using measured SLO capacity",
+    )
     parser.add_argument("--timeout", type=float, default=120.0)
     args = parser.parse_args()
     if not 0 < args.port < 65536 or not 0 < args.timeout < float("inf"):
@@ -864,18 +873,24 @@ def main() -> None:
         parser.error("--control-seed requires --native-routes")
     elif args.routes is None and not args.control_peer:
         parser.error("--model requires at least one --control-peer")
+    if args.mode_policy is not None and args.native_routes is None:
+        parser.error("--mode-policy requires --native-routes")
     if args.kv_transport is None:
         args.kv_transport = "nixl"
-    load = None
+    load = (
+        Load(args.model)
+        if args.model is not None
+        and (args.load_listen is not None or args.mode_policy is not None)
+        else None
+    )
     load_context = contextlib.nullcontext()
     if args.load_listen is not None:
-        if args.model is None:
+        if load is None:
             parser.error("--load-listen requires a managed model")
         try:
             address = parse_load_address(args.load_listen)
         except ValueError as error:
             parser.error(str(error))
-        load = Load(args.model)
         load_context = load_listener(address, load)
 
     def interrupt(_signum: int, _frame: object) -> None:
@@ -885,7 +900,7 @@ def main() -> None:
     try:
         with (
             load_context,
-            route_source(args) as directory,
+            route_source(args, load) as directory,
             server(
                 args.host,
                 args.port,
@@ -903,33 +918,53 @@ def main() -> None:
 
 
 @contextlib.contextmanager
-def route_source(args: argparse.Namespace):
+def route_source(args: argparse.Namespace, load: Load | None = None):
     if args.routes is not None:
         yield Directory(args.routes)
         return
     native = args.native_routes is not None
-    control = Control(
-        args.control_bin,
-        args.control_peer,
-        args.control_listen,
-        seeds=args.control_seed,
-        command="group" if native else "serving",
-    )
+
+    def control(listen: str = args.control_listen) -> Control:
+        return Control(
+            args.control_bin,
+            args.control_peer,
+            listen,
+            seeds=args.control_seed,
+            command="group" if native else "serving",
+        )
+
     directory = (
-        NativeDirectory(args.model, control, args.native_routes)
+        NativeDirectory(args.model, control(), args.native_routes)
         if native
-        else ControlDirectory(args.model, control)
+        else ControlDirectory(args.model, control())
     )
     stop = threading.Event()
     watcher = threading.Thread(
         target=directory.watch, args=(stop,), name="plait-route-directory"
     )
-    watcher.start()
+    threads = [watcher]
+    if (
+        isinstance(directory, NativeDirectory)
+        and args.mode_policy is not None
+        and load is not None
+    ):
+        host, _, _port = args.control_listen.rpartition(":")
+        controller = ModeController(args.mode_policy, load, control(f"{host}:0"))
+        threads.append(
+            threading.Thread(
+                target=controller.watch,
+                args=(stop, directory.mode_snapshot),
+                name="plait-serving-mode",
+            )
+        )
+    for thread in threads:
+        thread.start()
     try:
         yield directory
     finally:
         stop.set()
-        watcher.join()
+        for thread in threads:
+            thread.join()
 
 
 if __name__ == "__main__":

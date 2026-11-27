@@ -18,7 +18,12 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from vllm.entrypoints.serve.plait_serving import aggregate, benchmark, disaggregate
+from vllm.entrypoints.serve.plait_serving import (
+    aggregate,
+    benchmark,
+    disaggregate,
+    mode,
+)
 from vllm.entrypoints.serve.plait_serving import group as group_tools
 from vllm.entrypoints.serve.plait_serving.group import (
     ADMISSION_HEADER,
@@ -599,6 +604,165 @@ class DirectoryTest(unittest.TestCase):
         directory.until = 0
         with self.assertRaises(ValueError):
             directory.routes()
+
+
+class ModePolicyTest(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.policy = Path(directory.name) / "policy.json"
+        self.groups = tuple(bytes([index] * 16).hex() for index in (1, 2, 3, 4))
+        self.versions = [f"{group}@1" for group in self.groups]
+        aggregate, prefill, decode, standby = self.versions
+        self.versions.append(f"{self.groups[0]}@2")
+        self.routes = (
+            (Endpoint("127.0.0.1", 8001, aggregate, "aggregated"),),
+            (
+                Endpoint("127.0.0.1", 8002, prefill, "prefill"),
+                Endpoint("127.0.0.1", 8003, decode, "decode"),
+            ),
+            (Endpoint("127.0.0.1", 8004, standby, "aggregated"),),
+            (Endpoint("127.0.0.1", 8005, self.versions[-1], "aggregated"),),
+        )
+        self.config = {
+            "route_revision": 1,
+            "window_seconds": 1,
+            "stable_windows": 2,
+            "horizon_seconds": 20,
+            "cooldown_seconds": 2,
+            "device_cost_requests_per_second": 1,
+            "switch_loss_requests": 2,
+            "minimum_gain_requests": 1,
+            "modes": [
+                self.profile(versions, devices, rps)
+                for versions, devices, rps in (
+                    ([aggregate], 1, 4),
+                    ([prefill, decode], 2, 15),
+                    ([self.versions[-1]], 1, 4),
+                )
+            ],
+        }
+        self.policy.write_text(json.dumps(self.config))
+        self.clock = 0
+        self.arrivals = 0
+        self.active = frozenset([aggregate])
+        self.ready = {prefill, decode}
+        self.requests = []
+        self.may_lose_reply = False
+        self.control = Mock()
+        self.control.next_operation_id.return_value = "operation-id"
+        self.control.request.side_effect = self.request
+        self.load = Mock()
+        self.load.snapshot.side_effect = lambda: {
+            "session": "ingress",
+            "uptime_ms": self.clock * 1000,
+            "arrivals": self.arrivals,
+        }
+        self.controller = mode.ModeController(self.policy, self.load, self.control)
+        clock = SimpleNamespace(
+            monotonic=lambda: self.clock, time_ns=lambda: self.clock * 10**9
+        )
+        self.enterContext(patch.object(mode, "time", clock))
+        self.health = self.enterContext(
+            patch.object(mode, "endpoint_ready", return_value=True)
+        )
+
+    def profile(self, versions, devices, rps, valid_until_ms=60_000):
+        return {
+            "versions": versions,
+            "devices": devices,
+            "slo_profile": {"rps": rps, "valid_until_ms": valid_until_ms},
+        }
+
+    def request(self, request):
+        if request["request"] == "view":
+            version = request["version"]
+            epoch = f"{bytes(version['group']).hex()}@{version['epoch']}"
+            phase = (
+                "Active"
+                if epoch in self.active
+                else ("Ready" if epoch in self.ready else "Preparing")
+            )
+            return {"group": {"phase": phase, "version": version, "grants": [{}]}}
+        transition = request["operation"]["action"]["SwitchActiveSet"]["transitions"]
+        self.requests.append(request)
+        if self.may_lose_reply:
+            self.may_lose_reply = False
+            raise mode.ControlError("reply lost")
+        return {
+            "result": {
+                "Ok": {
+                    "ActiveSet": [
+                        [change["group"], change["target"]] for change in transition
+                    ]
+                }
+            }
+        }
+
+    def snapshot(self):
+        return mode.ModeView(1, self.routes, self.groups, self.active)
+
+    def sample(self, arrivals, seconds=1):
+        self.clock += seconds
+        self.arrivals += arrivals
+        self.controller.reconcile(self.snapshot(), self.snapshot)
+
+    def changes(self):
+        return self.requests[-1]["operation"]["action"]["SwitchActiveSet"][
+            "transitions"
+        ]
+
+    def test_switches_up_then_returns_to_a_new_epoch_after_a_stable_low_load(self):
+        self.sample(0, seconds=0)
+        self.sample(10)
+        self.assertEqual(self.requests, [])
+        self.may_lose_reply = True
+        self.sample(10)
+        self.assertEqual(self.requests[0], self.requests[1])
+        self.assertEqual(
+            [(change["expected"], change["target"]) for change in self.changes()],
+            [(1, None), (None, 1), (None, 1), (None, None)],
+        )
+        self.active = frozenset(self.versions[1:3])
+        self.ready = {self.versions[-1]}
+        self.sample(1)
+        self.sample(12)
+        self.sample(12)
+        self.assertEqual(len(self.requests), 2)
+        self.sample(1)
+        self.assertEqual(len(self.requests), 2)
+        self.sample(1)
+        self.assertEqual(len(self.requests), 3)
+        self.assertEqual(
+            [(change["expected"], change["target"]) for change in self.changes()],
+            [(None, 2), (1, None), (1, None), (None, None)],
+        )
+
+    def test_requires_fresh_capacity_complete_routes_and_ready_http(self):
+        self.sample(0, seconds=0)
+        self.health.side_effect = lambda endpoint, timeout: endpoint.role != "decode"
+        self.sample(12)
+        self.sample(12)
+        self.assertEqual(self.requests, [])
+
+        self.health.side_effect = None
+        self.config["modes"].append(self.profile([self.versions[1]], 1, 50))
+        self.config["modes"][1]["slo_profile"]["valid_until_ms"] = 2000
+        self.policy.write_text(json.dumps(self.config))
+        self.sample(12)
+        self.sample(12)
+        self.sample(12)
+        self.assertEqual(self.requests, [])
+
+    def test_rechecks_the_observation_before_submitting(self):
+        self.sample(0, seconds=0)
+        self.sample(12)
+        self.arrivals += 12
+        self.clock += 1
+        old = self.snapshot()
+        self.active = frozenset([self.versions[0], self.versions[3]])
+        self.controller.reconcile(old, self.snapshot)
+        self.assertEqual(self.requests, [])
 
 
 class HandoffTest(unittest.TestCase):
