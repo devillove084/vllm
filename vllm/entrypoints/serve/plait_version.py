@@ -28,11 +28,14 @@ class NativeGroupHeaders:
         descriptor = os.environ.get("VLLM_PLAIT_TP_GROUP_CONFIG")
         if os.environ.get("VLLM_USE_PLAIT") != "1" or descriptor is None:
             raise ValueError("group middleware requires a committed Plait launch")
-        groups = json.loads(Path(descriptor).read_text(encoding="utf-8"))["tp_groups"]
+        deployment = json.loads(Path(descriptor).read_text(encoding="utf-8"))
+        groups = deployment.get("tp_groups", []) + deployment.get("pp_groups", [])
         if len(groups) != 1 or not re.fullmatch(
             r"[a-f0-9]{32}@[1-9][0-9]*", groups[0]["version"]
         ):
-            raise ValueError("group middleware requires one valid TP group version")
+            raise ValueError(
+                "group middleware requires one valid execution group version"
+            )
         self.version = groups[0]["version"]
         self.response_headers = [
             (_VERSION, self.version.encode("ascii")),

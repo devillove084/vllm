@@ -18,25 +18,32 @@ if TYPE_CHECKING:
 
 
 @dataclass(frozen=True)
-class CommittedTpGroup:
+class CommittedGroup:
     version: str
     seeds: list[str]
     devices: list[tuple[str, int]]
     compute_calibration: GemmCalibration | None = None
 
     @classmethod
-    def load(cls, path: str, ranks: list[int], slot: int) -> "CommittedTpGroup":
-        """Resolve this worker's TP group against the launcher's device bindings."""
+    def load(
+        cls, path: str, ranks: list[int], slot: int, axis: str = "tp"
+    ) -> "CommittedGroup | None":
+        """Resolve a worker's model-parallel group against its device binding."""
         with open(path, encoding="utf-8") as file:
             config = json.load(file)
-        matches = [group for group in config["tp_groups"] if group["ranks"] == ranks]
+        key = f"{axis}_groups"
+        if key not in config and ("tp_groups" in config or "pp_groups" in config):
+            return None
+        matches = [group for group in config.get(key, []) if group["ranks"] == ranks]
         if len(matches) != 1:
-            raise ValueError(f"Expected one committed Plait TP group for ranks {ranks}")
+            raise ValueError(
+                f"Expected one committed Plait {axis.upper()} group for ranks {ranks}"
+            )
         group = matches[0]
         devices = [(host.lower(), ordinal) for host, ordinal in group["devices"]]
         if len(devices) != len(ranks) or devices[slot][0] != config["host_id"].lower():
             raise ValueError(
-                f"Plait TP device binding does not match worker {ranks[slot]}"
+                f"Plait {axis.upper()} binding does not match worker {ranks[slot]}"
             )
         calibration = group.get("compute_calibration")
         if calibration is not None:
@@ -110,8 +117,7 @@ def agree_on_plait_layout(
     if any(other != layout for other in observed):
         raise ValueError(
             "Inconsistent --plait-tp-layout, TP/PP sizes, layer partition "
-            "or KV capabilities: "
-            + ", ".join(plan.decode() for plan in observed)
+            "or KV capabilities: " + ", ".join(plan.decode() for plan in observed)
         )
     return launch_store
 

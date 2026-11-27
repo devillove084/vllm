@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Launch vLLM from Plait TP grants and publish healthy, versioned origins."""
+"""Launch vLLM from Plait grants and publish healthy, versioned origins."""
 
 import argparse
 import ctypes
@@ -85,6 +85,7 @@ class Deployment:
     compute_calibration: dict | None = None
     max_num_batched_tokens: int = 2048
     max_num_seqs: int = 128
+    pipeline_layers: dict[str, list[int]] | None = None
 
     def __post_init__(self) -> None:
         parse_id(self.group_id)
@@ -92,6 +93,15 @@ class Deployment:
             raise ValueError("model alias, seeds and host addresses are required")
         if not 0 < self.max_num_seqs <= self.max_num_batched_tokens:
             raise ValueError("batch limits must allow at least one token per sequence")
+        for width, stages in (self.pipeline_layers or {}).items():
+            if (
+                width != str(len(stages))
+                or len(stages) < 2
+                or any(type(layers) is not int or layers < 1 for layers in stages)
+            ):
+                raise ValueError(
+                    "pipeline_layers needs one positive layer count per stage"
+                )
         for host, address in self.hosts.items():
             parse_id(host)
             ip = ipaddress.ip_address(address)
@@ -118,6 +128,8 @@ class Deployment:
         if not devices or devices.keys() - self.hosts.keys():
             raise ValueError("placement needs a host outside the deployment")
         ordered = {host: sorted(ordinals) for host, ordinals in sorted(devices.items())}
+        width = sum(len(ordinals) for ordinals in ordered.values())
+        layers = (self.pipeline_layers or {}).get(str(width), ())
         offset = (version["epoch"] - 1) % self.epoch_ports
         return Placement(
             version,
@@ -126,6 +138,7 @@ class Deployment:
             self.hosts[next(iter(ordered))],
             self.api_port_base + offset,
             self.rendezvous_port_base + offset,
+            tuple(layers),
         )
 
 
@@ -137,6 +150,7 @@ class Placement:
     api_address: str
     api_port: int
     rendezvous_port: int
+    pipeline_layers: tuple[int, ...] = ()
 
     @property
     def origin(self) -> str:
@@ -157,7 +171,8 @@ class Placement:
         }
         if calibration is not None:
             group["compute_calibration"] = calibration
-        return {"host_id": host, "seeds": seeds, "tp_groups": [group]}
+        axis = "pp" if self.pipeline_layers else "tp"
+        return {"host_id": host, "seeds": seeds, f"{axis}_groups": [group]}
 
 
 @dataclass
@@ -218,13 +233,17 @@ class Engine:
         nodes = list(placement.devices)
         counts = [len(placement.devices[node]) for node in nodes]
         node_rank = nodes.index(host)
+        tp = 1 if placement.pipeline_layers else sum(counts)
+        pp = len(placement.pipeline_layers) or 1
         command = [
             *self.argv,
             "serve",
             self.model,
             *self.args,
             "--tensor-parallel-size",
-            str(sum(counts)),
+            str(tp),
+            "--pipeline-parallel-size",
+            str(pp),
             "--served-model-name",
             deployment.model_alias,
             "--distributed-executor-backend",
@@ -274,6 +293,10 @@ class Engine:
                 "VLLM_PLAIT_TP_GROUP_CONFIG": str(descriptor.resolve()),
             }
         )
+        if placement.pipeline_layers:
+            env["VLLM_PP_LAYER_PARTITION"] = ",".join(
+                map(str, placement.pipeline_layers)
+            )
         if len(nodes) > 1 and "GLOO_SOCKET_IFNAME" not in env:
             # Gloo otherwise picks a NIC using the hostname, which can resolve
             # to a management address on multi-homed workers.

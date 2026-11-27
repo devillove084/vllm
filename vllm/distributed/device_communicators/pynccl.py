@@ -28,7 +28,7 @@ from vllm.utils.network_utils import get_ip
 from vllm.utils.torch_utils import current_stream
 
 if TYPE_CHECKING:
-    from vllm.distributed.plait_rendezvous import CommittedTpGroup
+    from vllm.distributed.plait_rendezvous import CommittedGroup
 
 logger = init_logger(__name__)
 
@@ -132,7 +132,7 @@ class PyNcclCommunicator:
         library_path: str | None = None,
         *,
         use_peer_group: bool = False,
-        committed_group: "CommittedTpGroup | None" = None,
+        committed_group: "CommittedGroup | None" = None,
     ):
         """Args:
             group: the process group to work on. If None, it will use the
@@ -160,7 +160,9 @@ class PyNcclCommunicator:
         self.group = group
 
         # if world_size == 1, no need to create communicator
-        if (self.world_size == 1 and committed_group is None) or envs.VLLM_DISABLE_PYNCCL:
+        if (
+            self.world_size == 1 and committed_group is None
+        ) or envs.VLLM_DISABLE_PYNCCL:
             self.available = False
             self.disabled = True
             return
@@ -226,7 +228,7 @@ class PyNcclCommunicator:
         device: int | str | torch.device,
         *,
         peer_group: ProcessGroup | None = None,
-        committed_group: "CommittedTpGroup | None" = None,
+        committed_group: "CommittedGroup | None" = None,
     ) -> None:
         """Connect the communicator, then run the one-element warm-up."""
         if isinstance(device, int):

@@ -181,14 +181,16 @@ class MultiprocExecutor(Executor):
                 transfer = self.vllm_config.kv_transfer_config
                 options = (
                     transfer.kv_connector_extra_config
-                    if transfer is not None and transfer.kv_connector == "PlaitKvConnector"
+                    if transfer is not None
+                    and transfer.kv_connector == "PlaitKvConnector"
                     else {}
                 )
                 self._plait_store = agree_on_plait_layout(
                     self.parallel_config,
                     seeded_resume=options.get("seeded_resume") is True,
                     checkpoint_admission=options.get("checkpoint_admission") is True,
-                    checkpoint_peer_budget=options.get("checkpoint_peer_budget") is True,
+                    checkpoint_peer_budget=options.get("checkpoint_peer_budget")
+                    is True,
                 )
                 logger.info(
                     "Plait worker layout %s: node_rank=%d, local worker ranks=%s",
@@ -1064,7 +1066,7 @@ class WorkerProc:
     ) -> None:
         """Execute one RPC in a separate frame from the dequeue loop."""
         method, args, kwargs, output_rank = rpc_request
-        plait_comm = None
+        plait_comms = []
         if (
             envs.VLLM_USE_PLAIT
             and method in ("execute_model", "sample_tokens", "execute_dummy_batch")
@@ -1074,13 +1076,14 @@ class WorkerProc:
                 PlaitCommunicator,
             )
 
-            communicator = get_tp_group().device_communicator
-            if isinstance(communicator, PlaitCommunicator):
-                plait_comm = communicator
+            for group in (get_tp_group(), get_pp_group()):
+                communicator = group.device_communicator
+                if isinstance(communicator, PlaitCommunicator):
+                    plait_comms.append(communicator)
 
         try:
-            if plait_comm is not None and plait_comm.failed:
-                raise RuntimeError("Plait tensor-parallel communicator has failed")
+            if any(comm.failed for comm in plait_comms):
+                raise RuntimeError("Plait model-parallel communicator has failed")
             if isinstance(method, str):
                 func = getattr(self.worker, method)
             elif isinstance(method, bytes):
@@ -1095,8 +1098,9 @@ class WorkerProc:
             if hasattr(e, "add_note"):
                 e.add_note(traceback.format_exc())
             logger.exception("WorkerProc hit an exception.")
-            if plait_comm is not None and not plait_comm.failed:
-                plait_comm.report_execution_failure()
+            for comm in plait_comms:
+                if not comm.failed:
+                    comm.report_execution_failure()
             # enqueue_output converts the exception to a FAILURE response
             # containing its string representation before transport.
             if output_rank is None or self.rank == output_rank:

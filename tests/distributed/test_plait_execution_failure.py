@@ -34,6 +34,13 @@ class TestPlaitExecutionFailure(unittest.TestCase):
         )
         patches.enter_context(
             patch.object(
+                multiproc_executor,
+                "get_pp_group",
+                return_value=SimpleNamespace(device_communicator=None),
+            )
+        )
+        patches.enter_context(
+            patch.object(
                 multiproc_executor, "model_parallel_is_initialized", return_value=True
             )
         )
@@ -60,6 +67,25 @@ class TestPlaitExecutionFailure(unittest.TestCase):
         self.proc._execute_worker_rpc(("execute_model", (), {}, 0))
         self.peer.report_execution_failure.assert_called_once_with()
         self.proc.handle_output.assert_called_once_with(self.error)
+
+    def test_pipeline_failure_closes_the_committed_group(self):
+        self.proc.rank = 1
+        with (
+            patch.object(
+                multiproc_executor.get_tp_group,
+                "return_value",
+                SimpleNamespace(device_communicator=None),
+            ),
+            patch.object(
+                multiproc_executor.get_pp_group,
+                "return_value",
+                SimpleNamespace(device_communicator=self.communicator),
+            ),
+        ):
+            self.proc._execute_worker_rpc(("execute_model", (), {}, 0))
+            self.proc._execute_worker_rpc(("sample_tokens", (), {}, 0))
+        self.peer.report_execution_failure.assert_called_once_with()
+        self.proc.worker.sample_tokens.assert_not_called()
 
     def test_non_model_rpc_keeps_comm_open(self):
         self.proc.rank = 0

@@ -84,6 +84,37 @@ class TestPlaitDeployment(unittest.TestCase):
             assert command[command.index("--max-num-batched-tokens") + 1] == "2048"
             assert command[command.index("--max-num-seqs") + 1] == "128"
 
+    def test_pipeline_launch_binds_the_full_group_and_preserves_layer_order(self):
+        self.config.pipeline_layers = {"2": [11, 17]}
+        grants = [
+            {"device": {"node": [2] * 16, "ordinal": 1}},
+            {"device": {"node": [1] * 16, "ordinal": 2}},
+        ]
+        placement = self.config.place(
+            {"version": self.placement.version, "grants": grants}
+        )
+        engine = Engine(["vllm"], "/models/example", "CUDA_VISIBLE_DEVICES", [], {})
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch(
+                "vllm.entrypoints.serve.plait_deploy.psutil.net_if_addrs",
+                return_value={},
+            ),
+            patch("vllm.entrypoints.serve.plait_deploy.subprocess.Popen") as spawn,
+        ):
+            engine.start(self.config, placement, self.first, Path(directory))
+            env = spawn.call_args.kwargs["env"]
+            command = spawn.call_args.args[0]
+            assert command[command.index("--tensor-parallel-size") + 1] == "1"
+            assert command[command.index("--pipeline-parallel-size") + 1] == "2"
+            assert env["VLLM_PP_LAYER_PARTITION"] == "11,17"
+            descriptor = json.loads(Path(env["VLLM_PLAIT_TP_GROUP_CONFIG"]).read_text())
+            assert set(descriptor) == {"host_id", "seeds", "pp_groups"}
+            assert descriptor["pp_groups"][0]["devices"] == [
+                [self.first, 2],
+                [self.second, 1],
+            ]
+
     def test_activation_stages_binding_and_retries_the_same_operation(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "routes.json"

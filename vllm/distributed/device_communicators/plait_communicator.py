@@ -8,7 +8,7 @@ from vllm.distributed.device_communicators.base_device_communicator import (
     DeviceCommunicatorBase,
 )
 from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
-from vllm.distributed.plait_rendezvous import CommittedTpGroup
+from vllm.distributed.plait_rendezvous import CommittedGroup
 from vllm.logger import init_logger
 from vllm.utils.network_utils import get_ip
 
@@ -23,7 +23,7 @@ class PlaitCommunicator(DeviceCommunicatorBase):
         cpu_group: ProcessGroup,
         device: torch.device,
         unique_name: str,
-        committed_group: CommittedTpGroup | None = None,
+        committed_group: CommittedGroup | None = None,
     ):
         super().__init__(cpu_group, device, unique_name=unique_name)
         self.pynccl_comm = PyNcclCommunicator(
@@ -31,10 +31,13 @@ class PlaitCommunicator(DeviceCommunicatorBase):
         )
         if self.pynccl_comm.disabled:
             raise RuntimeError(f"Plait communicator {unique_name} is disabled")
-        if committed_group is not None and committed_group.compute_calibration is not None:
+        if (
+            committed_group is not None
+            and committed_group.compute_calibration is not None
+        ):
             self._publish_compute_calibration(committed_group)
 
-    def _publish_compute_calibration(self, group: CommittedTpGroup) -> None:
+    def _publish_compute_calibration(self, group: CommittedGroup) -> None:
         calibration = group.compute_calibration
         assert calibration is not None
         comm = self.pynccl_comm.comm
