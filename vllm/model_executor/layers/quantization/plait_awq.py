@@ -16,6 +16,15 @@ from .auto_awq import _REVERSE_AWQ_PACK_ORDER, AutoAWQConfig, BaseAWQLinearMetho
 
 logger = init_logger(__name__)
 
+SUPPORTED_DEVICE_TYPES = ("cuda", "npu")
+
+
+def stream_handle(stream: torch.Stream) -> int:
+    if stream.device.type == "npu":
+        # The accessor submits pending torch_npu tasks before returning the ACL stream.
+        return stream.npu_stream
+    return stream.cuda_stream
+
 
 class Shape(ctypes.Structure):
     _fields_ = [
@@ -42,6 +51,11 @@ def kernel_library(path: str) -> ctypes.CDLL:
     return library
 
 
+def _unpack_awq_words(words: torch.Tensor, shifts: torch.Tensor) -> torch.Tensor:
+    lanes = words.unsqueeze(-1).expand(-1, -1, shifts.numel())
+    return ((lanes >> shifts) & 15).to(torch.uint8).flatten(1)
+
+
 def canonical_awq(
     qweight: torch.Tensor,
     qzeros: torch.Tensor,
@@ -52,11 +66,11 @@ def canonical_awq(
         * 4
     )
     # AWQ words pack output channels. Plait packs adjacent K values.
-    codes = ((qweight.unsqueeze(-1) >> shifts) & 15).to(torch.uint8).flatten(1)
+    codes = _unpack_awq_words(qweight, shifts)
     if codes.size(0) % 2:
         codes = torch.nn.functional.pad(codes, (0, 0, 0, 1))
     weights = (codes[0::2] | (codes[1::2] << 4)).transpose(0, 1).contiguous()
-    zeros = ((qzeros.unsqueeze(-1) >> shifts) & 15).to(torch.uint8).flatten(1)
+    zeros = _unpack_awq_words(qzeros, shifts)
     return (
         weights,
         scales.transpose(0, 1).contiguous(),
@@ -92,8 +106,8 @@ def _projection(
     output = _projection_fake(x, weights, scales, zero, bias, group_size, bits, path)
     if not output.numel():
         return output
-    if x.dtype != torch.half or x.device.type != "cuda":
-        raise ValueError("Plait AWQ needs FP16 activation on a CUDA-compatible device")
+    if x.dtype != torch.half or x.device.type not in SUPPORTED_DEVICE_TYPES:
+        raise ValueError("Plait AWQ needs FP16 activation on a CUDA or NPU device")
     k = x.shape[-1]
     n = weights.shape[0]
     rows = x.numel() // k
@@ -120,7 +134,8 @@ def _projection(
     required = library.plait_w4_stream_workspace_v1(ctypes.byref(shape), bits)
     if required == ctypes.c_size_t(-1).value:
         raise ValueError(f"unsupported Plait W4A{bits} projection shape")
-    with torch.cuda.device(x.device):
+    backend = torch.get_device_module(x.device)
+    with backend.device(x.device):
         activation = x.contiguous()
         scratch = torch.empty(required, dtype=torch.uint8, device=x.device)
         bias = bias.contiguous() if bias is not None else None
@@ -135,7 +150,7 @@ def _projection(
             output.data_ptr(),
             scratch.data_ptr(),
             required,
-            torch.cuda.current_stream(x.device).cuda_stream,
+            stream_handle(backend.current_stream(x.device)),
         )
     if status != 0:
         raise RuntimeError(f"Plait W4A{bits} projection launch failed ({status})")
@@ -160,8 +175,11 @@ class PlaitAWQLinearMethod(BaseAWQLinearMethod):
         logger.info_once("Plait dense AWQ uses W4A%d", self.bits)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if layer.scales.dtype != torch.half or layer.qweight.device.type != "cuda":
-            raise ValueError("Plait AWQ needs FP16 scales on a CUDA-compatible device")
+        if (
+            layer.scales.dtype != torch.half
+            or layer.qweight.device.type not in SUPPORTED_DEVICE_TYPES
+        ):
+            raise ValueError("Plait AWQ needs FP16 scales on a CUDA or NPU device")
         self.group_size = self.quant_config.group_size
         if self.group_size == -1:
             self.group_size = layer.qweight.shape[0]

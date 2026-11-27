@@ -1420,7 +1420,14 @@ class ModelConfig:
                     f"Unknown quantization method: {self.quantization}. Must "
                     f"be one of {supported_quantization}."
                 )
-            current_platform.verify_quantization(self.quantization)
+            # The explicit Plait library supplies the dense AWQ kernels on NPU.
+            plait_npu_awq = (
+                self.quantization == "auto_awq"
+                and current_platform.device_type == "npu"
+                and envs.VLLM_PLAIT_W4_LIBRARY
+            )
+            if not plait_npu_awq:
+                current_platform.verify_quantization(self.quantization)
 
         if self.quantization in me_quant.DEPRECATED_QUANTIZATION_METHODS:
             if self.allow_deprecated_quantization:

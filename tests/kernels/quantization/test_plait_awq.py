@@ -43,23 +43,29 @@ class PlaitAWQTest(unittest.TestCase):
         torch.testing.assert_close(scale, scales.T)
         torch.testing.assert_close(zeros, zero.T)
 
-    @unittest.skipUnless(
-        os.environ.get("VLLM_PLAIT_W4_LIBRARY") and torch.cuda.is_available(),
-        "requires a Plait integer kernel build for the accelerator",
-    )
     def test_integer_projection_on_caller_stream(self):
         from vllm.model_executor.layers.quantization.plait_awq import (
+            SUPPORTED_DEVICE_TYPES,
             Shape,
             canonical_awq,
             kernel_library,
+            stream_handle,
         )
+        from vllm.platforms import current_platform
 
-        library_path = os.environ["VLLM_PLAIT_W4_LIBRARY"]
+        library_path = os.environ.get("VLLM_PLAIT_W4_LIBRARY")
+        device = current_platform.device_type
+        if not library_path or device not in SUPPORTED_DEVICE_TYPES:
+            self.skipTest("requires a Plait integer kernel build for the accelerator")
+        backend = torch.get_device_module(device)
+        if not backend.is_available():
+            self.skipTest(f"no {device} device available")
         for bits in (4, 8):
             for m, n, k, group_size in (
                 (1, 64, 128, 64),
                 (16, 128, 128, 64),
                 (3, 16, 9, 3),
+                (3, 16, 265, 257),
             ):
                 with self.subTest(bits=bits, shape=(m, n, k), group_size=group_size):
                     generator = torch.Generator().manual_seed(19)
@@ -79,15 +85,20 @@ class PlaitAWQTest(unittest.TestCase):
                     expected = reference(
                         x, codes, scales, zeros, bias, group_size, bits
                     )
-                    p_w, p_s, p_z = canonical_awq(
-                        pack_awq(codes), pack_awq(zeros), scales
+                    qweight, qzeros, scale_device, x_device, bias_device = (
+                        tensor.to(device)
+                        for tensor in (
+                            pack_awq(codes),
+                            pack_awq(zeros),
+                            scales,
+                            x,
+                            bias,
+                        )
                     )
-                    p_w, p_s, p_z, x_device, bias_device = (
-                        tensor.cuda() for tensor in (p_w, p_s, p_z, x, bias)
-                    )
-                    stream = torch.cuda.Stream()
-                    stream.wait_stream(torch.cuda.current_stream())
-                    with torch.cuda.stream(stream):
+                    stream = backend.Stream()
+                    stream.wait_stream(backend.current_stream())
+                    with backend.stream(stream):
+                        p_w, p_s, p_z = canonical_awq(qweight, qzeros, scale_device)
                         result = torch.ops.vllm.plait_w4_projection(
                             x_device,
                             p_w,
@@ -104,7 +115,7 @@ class PlaitAWQTest(unittest.TestCase):
                         size = library.plait_w4_stream_workspace_v1(
                             ctypes.byref(shape), bits
                         )
-                        scratch = torch.empty(size, dtype=torch.uint8, device="cuda")
+                        scratch = torch.empty(size, dtype=torch.uint8, device=device)
                         status = library.plait_w4_stream_launch_v1(
                             ctypes.byref(shape),
                             bits,
@@ -116,7 +127,7 @@ class PlaitAWQTest(unittest.TestCase):
                             rejected.data_ptr(),
                             scratch.data_ptr(),
                             size - 1,
-                            stream.cuda_stream,
+                            stream_handle(stream),
                         )
                         self.assertNotEqual(status, 0)
                         x_device[0, 0] = torch.inf
