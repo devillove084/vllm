@@ -21,6 +21,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from .bindings import Bindings
+from .calibration import Calibrator, Target
 from .group import (
     DIRECTORY_POLL_SECONDS,
     DIRECTORY_READ_TTL,
@@ -195,6 +196,7 @@ class NativeDirectory(ControlDirectory):
         self.mode_view: ModeView | None = None
         self.configured: list[Destination] = []
         self.discovery: dict = {}
+        self.resolved: list[Destination] = []
 
     def refresh(self) -> None:
         document = json.loads(self.path.read_text(encoding="utf-8"))
@@ -232,9 +234,13 @@ class NativeDirectory(ControlDirectory):
             self.revision = revision
             self.configured = paths
             self.discovery = discovery
-            self.paths = [
+            self.resolved = [
                 replace(path, prefill_lease=False) if isinstance(path, Route) else path
-                for path, endpoints in zip(configured, bindings)
+                for path in configured
+            ]
+            self.paths = [
+                path
+                for path, endpoints in zip(self.resolved, bindings, strict=True)
                 if all(endpoint.version in active for endpoint in endpoints)
             ]
             self.mode_view = ModeView(revision, bindings, tuple(groups), active)
@@ -243,6 +249,21 @@ class NativeDirectory(ControlDirectory):
     def mode_snapshot(self) -> ModeView | None:
         with self.lock:
             return self.mode_view if time.monotonic() < self.until else None
+
+    def calibration_routes(self, target: Target) -> tuple[str, list[Destination]]:
+        with self.lock:
+            view = self.mode_view
+            if (
+                view is None
+                or time.monotonic() >= self.until
+                or not target.matches(view.revision, view.active, view.routes)
+            ):
+                raise ValueError("candidate calibration route expired")
+            return self.model, [
+                path
+                for path, endpoints in zip(self.resolved, view.routes, strict=True)
+                if endpoints in target.routes
+            ]
 
     def observe(self, groups: list[str]) -> set[str]:
         result = self.control.request(
@@ -402,10 +423,37 @@ def request_prefill(
     return Transfer(request_id, token, params)
 
 
+@dataclass(frozen=True)
+class CalibrationDirectory:
+    source: NativeDirectory
+    target: Target
+
+    def routes(self) -> tuple[str, list[Destination]]:
+        return self.source.calibration_routes(self.target)
+
+
+@contextlib.contextmanager
+def calibration_ingress(directory: NativeDirectory, target: Target, timeout: float):
+    candidate = CalibrationDirectory(directory, target)
+    candidate.routes()
+    with server("127.0.0.1", 0, candidate, timeout, "plait") as httpd:
+        thread = threading.Thread(
+            target=httpd.serve_forever,
+            kwargs={"poll_interval": 0.05},
+            name="plait-calibration-ingress",
+        )
+        thread.start()
+        try:
+            yield f"http://127.0.0.1:{httpd.server_port}"
+        finally:
+            httpd.shutdown()
+            thread.join()
+
+
 def server(
     bind: str,
     port: int,
-    directory: Directory | ControlDirectory,
+    directory: Directory | ControlDirectory | CalibrationDirectory,
     timeout: float,
     kv_transport: str = "nixl",
     load: Load | None = None,
@@ -959,7 +1007,13 @@ def route_source(args: argparse.Namespace, load: Load | None = None):
     ):
         host, _, _port = args.control_listen.rpartition(":")
         controller = ModeController(
-            args.mode_policy, load, control(f"{host}:0"), args.model
+            args.mode_policy,
+            load,
+            control(f"{host}:0"),
+            args.model,
+            Calibrator(
+                lambda target: calibration_ingress(directory, target, args.timeout)
+            ),
         )
         threads.append(
             threading.Thread(

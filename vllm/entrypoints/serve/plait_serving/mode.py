@@ -13,6 +13,7 @@ from pathlib import Path
 
 from vllm.entrypoints.serve.plait_deploy import Deployment
 
+from .calibration import Calibrator, Settings, Target
 from .group import (
     DIRECTORY_POLL_SECONDS,
     Control,
@@ -142,6 +143,7 @@ class Policy:
     minimum_gain_requests: float
     modes: tuple[Capacity, ...]
     provision: tuple[Provision, ...]
+    calibration: Settings | None
 
     @classmethod
     def read(cls, path: Path, model: str | None = None) -> "Policy":
@@ -173,6 +175,7 @@ class Policy:
             number(config["minimum_gain_requests"]),
             modes,
             provision,
+            Settings.read(config["calibration"]) if "calibration" in config else None,
         )
 
 
@@ -192,17 +195,17 @@ def gain(
 
 
 def endpoints_for(
-    mode: Capacity, routes: tuple[tuple[Endpoint, ...], ...]
+    versions: frozenset[str], routes: tuple[tuple[Endpoint, ...], ...]
 ) -> list[Endpoint]:
     endpoints = {
         endpoint
         for path in routes
-        if all(endpoint.version in mode.versions for endpoint in path)
+        if all(endpoint.version in versions for endpoint in path)
         for endpoint in path
     }
     if (
-        len(endpoints) != len(mode.versions)
-        or {endpoint.version for endpoint in endpoints} != mode.versions
+        len(endpoints) != len(versions)
+        or {endpoint.version for endpoint in endpoints} != versions
     ):
         return []
     return sorted(endpoints, key=lambda endpoint: endpoint.version)
@@ -215,15 +218,41 @@ class ModeView:
     groups: tuple[str, ...]
     active: frozenset[str]
 
+    def projection_routes(self, target: Provision) -> tuple[tuple[Endpoint, ...], ...]:
+        groups = {member.group for member in target.members}
+        routes = tuple(
+            route
+            for route in self.routes
+            if all(
+                endpoint.version not in self.active
+                and endpoint.version.split("@", 1)[0] in groups
+                for endpoint in route
+            )
+        )
+        versions = {endpoint.version for route in routes for endpoint in route}
+        if (
+            len(versions) != len(groups)
+            or {v.split("@", 1)[0] for v in versions} != groups
+        ):
+            return ()
+        return routes
+
 
 class ModeController:
     def __init__(
-        self, policy: Path, load: Load, control: Control, model: str | None = None
+        self,
+        policy: Path,
+        load: Load,
+        control: Control,
+        model: str | None = None,
+        calibrator: Calibrator | None = None,
     ):
         self.path = policy
         self.load = load
         self.control = control
         self.model = model
+        self.calibrator = calibrator
+        self.measured: dict[frozenset[str], tuple[Target, Capacity]] = {}
         self.previous: dict | None = None
         self.last_policy: Policy | None = None
         self.proposal: tuple[Capacity, Capacity | Provision] | None = None
@@ -245,6 +274,8 @@ class ModeController:
                     view = snapshot()
                     if view is None:
                         self.reset_evidence()
+                        if self.calibrator is not None:
+                            self.calibrator.cancel()
                     else:
                         self.reconcile(view, snapshot)
                     last_error = None
@@ -257,11 +288,15 @@ class ModeController:
                     OverflowError,
                 ) as error:
                     self.reset_evidence()
+                    if self.calibrator is not None:
+                        self.calibrator.cancel()
                     if str(error) != last_error:
                         print(f"Plait mode policy: {error}", flush=True)
                     last_error = str(error)
                 stop.wait(DIRECTORY_POLL_SECONDS)
         finally:
+            if self.calibrator is not None:
+                self.calibrator.cancel()
             self.control.close()
 
     def sample(self, window_seconds: float) -> float | None:
@@ -289,8 +324,17 @@ class ModeController:
         routes, active = view.routes, view.active
         policy = Policy.read(self.path, self.model)
         if policy != self.last_policy:
+            if (
+                self.last_policy is None
+                or policy.route_revision != self.last_policy.route_revision
+                or policy.calibration != self.last_policy.calibration
+            ):
+                self.measured.clear()
+            if self.calibrator is not None:
+                self.calibrator.cancel()
             self.last_policy = policy
             self.reset_evidence()
+        self.finish_calibration(view, policy, snapshot)
         demand = self.sample(policy.window_seconds)
         if (
             demand is None
@@ -299,10 +343,23 @@ class ModeController:
         ):
             return
         now_ms = time.time_ns() // 1_000_000
-        eligible = [
-            mode
+        self.measured = {
+            versions: (target, profile)
+            for versions, (target, profile) in self.measured.items()
+            if profile.valid_until_ms > now_ms
+            and target.revision == view.revision
+            and all(path in routes for path in target.routes)
+        }
+        profiles = {
+            versions: profile for versions, (_, profile) in self.measured.items()
+        }
+        profiles.update(
+            (mode.versions, mode)
             for mode in policy.modes
-            if mode.valid_until_ms > now_ms and endpoints_for(mode, routes)
+            if mode.valid_until_ms > now_ms
+        )
+        eligible = [
+            mode for mode in profiles.values() if endpoints_for(mode.versions, routes)
         ]
         incumbent = next((mode for mode in eligible if mode.versions == active), None)
         if incumbent is None:
@@ -329,10 +386,17 @@ class ModeController:
             None,
         )
         if chosen is None:
+            known = {mode.versions for mode in eligible}
             projections = (
                 (gain(policy, incumbent, target, demand), target)
                 for target in policy.provision
                 if target.valid_until_ms > now_ms
+                and frozenset(
+                    endpoint.version
+                    for path in view.projection_routes(target)
+                    for endpoint in path
+                )
+                not in known
             )
             chosen = max(
                 (
@@ -362,13 +426,17 @@ class ModeController:
             self.windows = 0
             return
         if isinstance(target, Provision):
-            if self.prepare(view, target):
+            if not self.calibrate(view, target, policy.calibration) and self.prepare(
+                view, target
+            ):
                 print(
                     f"Plait prepared a candidate layout at {demand:.2f} requests/s",
                     flush=True,
                 )
         else:
             self.switch(view.groups, active, target.versions)
+            if self.calibrator is not None:
+                self.calibrator.cancel()
             self.cooldown_until = time.monotonic() + policy.cooldown_seconds
             print(
                 f"Plait serving mode switched at {demand:.2f} requests/s "
@@ -377,6 +445,65 @@ class ModeController:
             )
         self.proposal = None
         self.windows = 0
+
+    def calibrate(
+        self, view: ModeView, projection: Provision, settings: Settings | None
+    ) -> bool:
+        if settings is None or self.calibrator is None or self.model is None:
+            return False
+        routes = view.projection_routes(projection)
+        if not routes:
+            return False
+        versions = frozenset(endpoint.version for path in routes for endpoint in path)
+        devices = self.device_count(versions, routes, view.active)
+        if devices is not None:
+            self.calibrator.start(
+                Target(view.revision, view.active, routes, devices),
+                settings,
+                self.model,
+            )
+        return True
+
+    def finish_calibration(
+        self, view: ModeView, policy: Policy, snapshot: Callable[[], ModeView | None]
+    ) -> None:
+        calibrator = self.calibrator
+        if calibrator is None or calibrator.run is None:
+            return
+        target = calibrator.run.target
+        if policy.calibration is None or not target.matches(
+            view.revision, view.active, view.routes
+        ):
+            calibrator.cancel()
+            return
+        result = calibrator.poll(policy.calibration)
+        if result is None:
+            return
+        capacity = Capacity.read(
+            {
+                "versions": sorted(target.versions),
+                "devices": target.devices,
+                "slo_profile": result,
+            }
+        )
+        if (
+            self.device_count(target.versions, target.routes, view.active)
+            != target.devices
+        ):
+            return
+        current = snapshot()
+        if (
+            current is None
+            or not target.matches(current.revision, current.active, current.routes)
+            or Policy.read(self.path, self.model) != policy
+            or capacity.valid_until_ms <= time.time_ns() // 1_000_000
+        ):
+            return
+        self.measured[target.versions] = (target, capacity)
+        print(
+            f"Plait measured candidate capacity {capacity.rps:.2f} requests/s",
+            flush=True,
+        )
 
     def prepare(self, view: ModeView, target: Provision) -> bool:
         incumbent = active_epochs(view.active)
@@ -415,8 +542,24 @@ class ModeController:
         *,
         verify_http: bool = True,
     ) -> bool:
+        return (
+            self.device_count(mode.versions, routes, active, verify_http=verify_http)
+            == mode.devices
+        )
+
+    def device_count(
+        self,
+        versions: frozenset[str],
+        routes: tuple[tuple[Endpoint, ...], ...],
+        active: frozenset[str],
+        *,
+        verify_http: bool = True,
+    ) -> int | None:
+        endpoints = endpoints_for(versions, routes)
+        if not endpoints:
+            return None
         devices = 0
-        for endpoint in endpoints_for(mode, routes):
+        for endpoint in endpoints:
             group, epoch = endpoint.version.split("@", 1)
             version = {"group": list(bytes.fromhex(group)), "epoch": int(epoch)}
             view = self.control.request({"request": "view", "version": version})[
@@ -424,11 +567,11 @@ class ModeController:
             ]
             phase = "Active" if endpoint.version in active else "Ready"
             if not view or view["version"] != version or view["phase"] != phase:
-                return False
+                return None
             if verify_http and not endpoint_ready(endpoint, 1.0):
-                return False
+                return None
             devices += len(view["grants"])
-        return devices == mode.devices
+        return devices
 
     def switch(
         self, groups: tuple[str, ...], active: frozenset[str], target: frozenset[str]

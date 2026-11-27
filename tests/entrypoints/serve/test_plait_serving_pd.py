@@ -25,6 +25,12 @@ from vllm.entrypoints.serve.plait_serving import (
     mode,
 )
 from vllm.entrypoints.serve.plait_serving import group as group_tools
+from vllm.entrypoints.serve.plait_serving.calibration import (
+    Calibrator,
+    Run,
+    Settings,
+    Target,
+)
 from vllm.entrypoints.serve.plait_serving.group import (
     ADMISSION_HEADER,
     CHECKPOINT_ADMISSION_HEADER,
@@ -422,6 +428,19 @@ class LaunchTest(unittest.TestCase):
 
 
 class CalibrationTest(unittest.TestCase):
+    def test_successful_process_observed_after_deadline_cannot_publish(self):
+        settings = Settings("/model", 16, 8, (2,), (1,), 100, 20)
+        calibrator = Calibrator(Mock())
+        cleanup = Mock()
+        process = Mock()
+        process.poll.return_value = 0
+        target = Target(1, frozenset(), (), 1)
+        calibrator.run = Run(target, process, cleanup, Path("unused"), 0.0)
+        with self.assertRaisesRegex(ValueError, "timed out"):
+            calibrator.poll(settings)
+        self.assertIsNone(calibrator.run)
+        cleanup.close.assert_called_once()
+
     def test_requires_repeatable_slo_and_does_not_skip_an_overloaded_rate(self):
 
         def trial(good, rps, end):
@@ -528,12 +547,19 @@ class DirectoryTest(unittest.TestCase):
             self.assertEqual(len(directory.mode_snapshot().routes), 1)
             phases[2] = "Ready"
             directory.refresh()
-            self.assertEqual(len(directory.mode_snapshot().routes), 2)
+            view = directory.mode_snapshot()
+            self.assertEqual(len(view.routes), 2)
+            candidate_routes = tuple(path for path in view.routes if len(path) == 2)
+            target = Target(view.revision, view.active, candidate_routes, 2)
+            _, [candidate] = directory.calibration_routes(target)
+            self.assertEqual(candidate.decode.port, 8108)
             [incumbent] = directory.routes()[1]
             self.assertEqual(incumbent.port, 8100)
             active[:] = [None, 1, 1]
             phases[:] = ["Draining", "Active", "Active"]
             directory.refresh()
+            with self.assertRaisesRegex(ValueError, "expired"):
+                directory.calibration_routes(target)
             [route] = directory.routes()[1]
             self.assertEqual(
                 (route.prefill.port, route.decode.port, route.kv_port),
@@ -946,6 +972,68 @@ class ModePolicyTest(unittest.TestCase):
         self.sample(12)
         self.sample(12)
         self.assertEqual(self.plans, [])
+        self.assertEqual(self.requests, [])
+
+    def configure_calibration(self):
+        self.configure_provision()
+        self.config["calibration"] = {
+            "model": "/model",
+            "input_tokens": 128,
+            "output_tokens": 8,
+            "rates": [15],
+            "seeds": [1],
+            "ttft_ms": 100,
+            "tpot_ms": 20,
+        }
+        self.policy.write_text(json.dumps(self.config))
+        calibrator = self.controller.calibrator = Mock()
+        calibrator.run = None
+        self.controller.model = "test"
+        self.sample(0, seconds=0)
+        return calibrator
+
+    def test_uses_live_calibration_to_switch_and_as_the_next_incumbent(self):
+        calibrator = self.configure_calibration()
+        self.sample(12)
+        self.assertEqual(calibrator.start.call_count, 0)
+        self.sample(12)
+        target = calibrator.start.call_args.args[0]
+        self.assertEqual(target.versions, frozenset(self.versions[1:3]))
+        self.assertEqual(target.devices, 2)
+        self.assertEqual(self.requests, [])
+
+        def poll(_settings):
+            calibrator.run = None
+            return self.target["slo_profile"]
+
+        calibrator.run = SimpleNamespace(target=target)
+        calibrator.poll.side_effect = poll
+        self.sample(12)
+        self.assertEqual(len(self.requests), 0)
+        # The measured candidate has to win its own complete window sequence.
+        self.sample(12)
+        self.assertEqual(len(self.requests), 1)
+        self.active = target.versions
+        self.ready = {self.versions[-1]}
+        self.config["modes"].append(self.profile([self.versions[-1]], 1, 4))
+        self.policy.write_text(json.dumps(self.config))
+        self.sample(1)
+        self.sample(1)
+        self.sample(1)
+        self.assertEqual(len(self.requests), 2)
+
+    def test_discards_calibration_if_candidate_binding_changes_before_publication(self):
+        calibrator = self.configure_calibration()
+        self.sample(12)
+        self.sample(12)
+        target = calibrator.start.call_args.args[0]
+        calibrator.run = SimpleNamespace(target=target)
+        calibrator.poll.return_value = self.target["slo_profile"]
+        self.clock += 1
+        previous = self.snapshot()
+        self.routes = tuple(path for path in self.routes if path not in target.routes)
+        self.controller.reconcile(previous, self.snapshot)
+        self.assertEqual(self.controller.measured, {})
         self.assertEqual(self.requests, [])
 
 

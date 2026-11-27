@@ -24,3 +24,4 @@ check PlaitKvHandoff PlaitKvHandoff
 check PlaitPdStreamReplay PlaitPdStreamReplay
 check PlaitServingModePolicy PlaitServingModePolicy
 check PlaitServingProvision PlaitServingProvision
+check PlaitServingCalibration PlaitServingCalibration
