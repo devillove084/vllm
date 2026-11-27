@@ -17,6 +17,7 @@ import time
 import uuid
 from contextlib import ExitStack, closing, suppress
 from dataclasses import dataclass, replace
+from hashlib import sha256
 from http.client import HTTPConnection, HTTPException
 from pathlib import Path
 from socket import AF_INET
@@ -86,6 +87,16 @@ def parse_id(text: str) -> bytes:
     return bytes.fromhex(text)
 
 
+def recipe_binding_id(base_id: str, width: int, egress_bytes: int | None) -> str:
+    if egress_bytes is None:
+        return base_id
+    digest = sha256(b"plait-peer-all-reduce-recipe-v1")
+    digest.update(parse_id(base_id))
+    digest.update(width.to_bytes(8, "little"))
+    digest.update(egress_bytes.to_bytes(8, "little"))
+    return digest.hexdigest()[:32]
+
+
 @dataclass
 class Deployment:
     group_id: str
@@ -106,12 +117,16 @@ class Deployment:
         return cls(**json.loads(path.read_text(encoding="utf-8")))
 
     def reload_hosts(self, path: Path) -> "Deployment":
+        """Read host and recipe additions while retaining existing bindings."""
         updated = self.read(path)
+        old_recipes = self.layout_recipes or {}
+        new_recipes = updated.layout_recipes or {}
         if (
-            replace(updated, hosts=self.hosts) != self
+            replace(updated, hosts=self.hosts, layout_recipes=self.layout_recipes) != self
             or not self.hosts.items() <= updated.hosts.items()
+            or any(new_recipes.get(key) != value for key, value in old_recipes.items())
         ):
-            raise ValueError("live deployment changes may only add host addresses")
+            raise ValueError("live deployment changes may only add hosts or recipes")
         return updated
 
     def __post_init__(self) -> None:
@@ -129,15 +144,24 @@ class Deployment:
                 raise ValueError(
                     "pipeline_layers needs one positive layer count per stage"
                 )
+        if self.layout_recipes is not None and not isinstance(self.layout_recipes, dict):
+            raise ValueError("layout_recipes must map IDs to recipe objects")
         for recipe_id, recipe in (self.layout_recipes or {}).items():
             parse_id(recipe_id)
+            if not isinstance(recipe, dict):
+                raise ValueError("layout_recipes must map IDs to recipe objects")
             width = recipe.get("width")
             layers = recipe.get("pipeline_layers", [])
+            egress = recipe.get("replicated_egress_bytes")
             if (
-                set(recipe) - {"width", "pipeline_layers"}
+                set(recipe) - {"width", "pipeline_layers", "replicated_egress_bytes"}
                 or type(width) is not int
-                or width < 1
+                or not 0 < width < 2**32
                 or not isinstance(layers, list)
+                or (
+                    egress is not None
+                    and (layers or type(egress) is not int or not 0 <= egress < 2**64)
+                )
                 or (
                     layers
                     and (
@@ -148,8 +172,10 @@ class Deployment:
                 )
             ):
                 raise ValueError(
-                    "layout recipe needs a width and valid pipeline layers"
+                    "layout recipe needs a valid width, layers and TP AllReduce budget"
                 )
+        if len(self.recipe_bindings()) != len(self.layout_recipes or {}):
+            raise ValueError("duplicate committed Plait recipe binding")
         for host, address in self.hosts.items():
             parse_id(host)
             ip = ipaddress.ip_address(address)
@@ -163,6 +189,14 @@ class Deployment:
             or bases[1] + self.epoch_ports > 65536
         ):
             raise ValueError("configure disjoint API and rendezvous port ranges")
+
+    def recipe_bindings(self) -> dict[str, dict]:
+        return {
+            recipe_binding_id(
+                key, recipe["width"], recipe.get("replicated_egress_bytes")
+            ): recipe
+            for key, recipe in (self.layout_recipes or {}).items()
+        }
 
     def place(self, view: dict) -> "Placement":
         version = view["version"]
@@ -178,18 +212,20 @@ class Deployment:
         ordered = {host: sorted(ordinals) for host, ordinals in sorted(devices.items())}
         width = sum(len(ordinals) for ordinals in ordered.values())
         layers = (self.pipeline_layers or {}).get(str(width), ())
+        egress = None
         if "recipe" not in view and self.layout_recipes:
             raise ValueError(
                 "layout recipes require a recipe-aware Plait control plane"
             )
         if view.get("recipe") is not None:
             recipe_id = bytes(view["recipe"]).hex()
-            recipe = (self.layout_recipes or {}).get(recipe_id)
+            recipe = self.recipe_bindings().get(recipe_id)
             if recipe is None or recipe["width"] != width:
                 raise ValueError(
                     f"missing launch definition for committed recipe {recipe_id}"
                 )
             layers = recipe.get("pipeline_layers", ())
+            egress = recipe.get("replicated_egress_bytes")
         offset = (version["epoch"] - 1) % self.epoch_ports
         return Placement(
             version,
@@ -199,6 +235,7 @@ class Deployment:
             self.api_port_base + offset,
             self.rendezvous_port_base + offset,
             tuple(layers),
+            egress,
         )
 
 
@@ -211,6 +248,7 @@ class Placement:
     api_port: int
     rendezvous_port: int
     pipeline_layers: tuple[int, ...] = ()
+    replicated_egress_bytes: int | None = None
 
     @property
     def origin(self) -> str:
@@ -231,6 +269,8 @@ class Placement:
         }
         if calibration is not None:
             group["compute_calibration"] = calibration
+        if self.replicated_egress_bytes is not None:
+            group["replicated_egress_bytes"] = self.replicated_egress_bytes
         axis = "pp" if self.pipeline_layers else "tp"
         return {"host_id": host, "seeds": seeds, f"{axis}_groups": [group]}
 

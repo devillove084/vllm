@@ -139,6 +139,43 @@ class TestPlaitDeployment(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "committed recipe"):
             self.config.place({**view, "recipe": [6] * 16})
 
+    def test_live_recipe_addition_preserves_the_active_binding(self):
+        original, new = "03" * 16, "04" * 16
+        self.config.layout_recipes = {original: {"width": 3}}
+        tuned = {"width": 3, "replicated_egress_bytes": 256 * 1024}
+        view = {
+            "version": self.placement.version,
+            "grants": [
+                {"device": {"node": [1] * 16, "ordinal": 0}},
+                {"device": {"node": [1] * 16, "ordinal": 1}},
+                {"device": {"node": [2] * 16, "ordinal": 1}},
+            ],
+        }
+        legacy_view = {**view, "recipe": [3] * 16}
+        planned_view = {
+            **view,
+            "version": {**view["version"], "epoch": view["version"]["epoch"] + 1},
+            "recipe": list(bytes.fromhex("a04f7569b5d79140032b71bdf79dd49a")),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "deployment.json"
+            recipes = {**self.config.layout_recipes, new: tuned}
+            path.write_text(json.dumps({**vars(self.config), "layout_recipes": recipes}))
+            updated = self.config.reload_hosts(path)
+            old = updated.place(legacy_view).descriptor(self.first, updated.seeds)
+            newer = updated.place(planned_view).descriptor(self.first, updated.seeds)
+            assert "replicated_egress_bytes" not in old["tp_groups"][0]
+            assert newer["tp_groups"][0]["replicated_egress_bytes"] == 256 * 1024
+            with self.assertRaisesRegex(ValueError, "committed recipe"):
+                updated.place({**planned_view, "recipe": [4] * 16})
+            recipes[new] = {**tuned, "replicated_egress_bytes": 0}
+            path.write_text(json.dumps({**vars(self.config), "layout_recipes": recipes}))
+            with self.assertRaisesRegex(ValueError, "only add hosts or recipes"):
+                updated.reload_hosts(path)
+            wrong = Deployment.read(path)
+            with self.assertRaisesRegex(ValueError, "committed recipe"):
+                wrong.place(planned_view)
+
     def test_activation_stages_binding_and_retries_the_same_operation(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "routes.json"
