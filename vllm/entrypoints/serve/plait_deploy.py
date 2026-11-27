@@ -3,6 +3,7 @@
 """Launch vLLM from Plait TP grants and publish healthy, versioned origins."""
 
 import argparse
+import ctypes
 import fcntl
 import ipaddress
 import json
@@ -10,6 +11,7 @@ import os
 import re
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
@@ -22,7 +24,7 @@ from typing import Any
 
 import psutil
 
-from vllm.entrypoints.serve.plait_version import ROLE_HEADER, VERSION_HEADER
+from vllm.entrypoints.serve.plait_version import DRAIN_PATH, ROLE_HEADER, VERSION_HEADER
 
 
 class ControlUnavailable(RuntimeError):
@@ -298,19 +300,23 @@ class Engine:
             )
 
 
-def healthy(placement: Placement) -> bool:
+def versioned_status(placement: Placement, path: str, status: int) -> bool:
     headers = {VERSION_HEADER: placement.version_text, ROLE_HEADER: "aggregated"}
     try:
         with closing(
             HTTPConnection(placement.api_address, placement.api_port, 2)
         ) as conn:
-            conn.request("GET", "/health", headers=headers)
+            conn.request("GET", path, headers=headers)
             with conn.getresponse() as response:
-                return response.status == 200 and all(
+                return response.status == status and all(
                     response.getheader(key) == value for key, value in headers.items()
                 )
     except (OSError, HTTPException):
         return False
+
+
+def healthy(placement: Placement) -> bool:
+    return versioned_status(placement, "/health", 200)
 
 
 def publish(path: Path, placement: Placement) -> None:
@@ -376,20 +382,83 @@ class RoutePublisher:
 @dataclass
 class WorkerProcess:
     process: subprocess.Popen[bytes]
-    failure: dict
-    reported: bool = False
+    placement: Placement
+    grants: list[dict]
+    drain_marker: Path | None
+    closing: bool = False
+    pending: dict | None = None
+    release_index: int = 0
+    group_exited: bool = False
 
-    def report_exit(self, control: Control) -> None:
-        if self.reported or self.process.poll() is None:
-            return
-        result = control.request("apply", operation=self.failure)["result"]
+    def apply(self, control: Control, action: dict) -> None:
+        if self.pending is None or self.pending["action"] != action:
+            self.pending = {"id": operation_id(), "action": action}
+        result = control.request("apply", operation=self.pending)["result"]
+        self.pending = None
         if "Ok" not in result:
-            raise ControlUnavailable(f"Plait failure report rejected: {result['Err']}")
-        self.reported = True
+            raise ControlUnavailable(f"Plait group operation rejected: {result['Err']}")
+
+    def gone(self) -> bool:
+        if self.group_exited:
+            return True
+        if self.process.poll() is None:
+            return False
+        # Reap adopted descendants in this process group after its leader
+        # exits. A leader exit alone does not prove the device owner left.
+        with suppress(ChildProcessError):
+            while os.waitpid(-self.process.pid, os.WNOHANG)[0]:
+                pass
+        try:
+            os.killpg(self.process.pid, 0)
+        except ProcessLookupError:
+            self.group_exited = True
+            return True
+        return False
+
+    def reconcile(self, control: Control) -> bool:
+        version = self.placement.version
+        if not self.closing:
+            view = control.request("view", version=version)["group"]
+            phase = view["phase"] if view else None
+            if phase in ("Draining", "Revoked", "Retired"):
+                view = control.observe(version)
+                phase = view["phase"] if view else None
+            if phase not in ("Revoked", "Retired") and self.process.poll() is not None:
+                self.apply(
+                    control,
+                    {"ReportFailure": {"grant": self.grants[0], "fault": "Device"}},
+                )
+            elif phase == "Draining" and self.drain_marker is not None:
+                self.drain_marker.touch(exist_ok=True)
+                if versioned_status(self.placement, DRAIN_PATH, 204):
+                    self.apply(control, {"Revoke": version})
+            elif phase in ("Revoked", "Retired"):
+                if not self.gone():
+                    self.signal(signal.SIGTERM)
+                self.closing = True
+        if not self.closing or not self.gone():
+            return False
+        while self.release_index < len(self.grants):
+            self.apply(control, {"Release": self.grants[self.release_index]})
+            self.release_index += 1
+        print(
+            f"Released local Plait grants for {self.placement.version_text}", flush=True
+        )
+        return True
 
     def signal(self, sig: signal.Signals) -> None:
         with suppress(ProcessLookupError):
             os.killpg(self.process.pid, sig)
+
+
+def reap_orphaned_workers() -> None:
+    if sys.platform == "linux":
+        # Keep orphaned vLLM workers attached to this launcher, including
+        # inside containers whose PID 1 does not reap children.
+        libc = ctypes.CDLL(None, use_errno=True)
+        if libc.prctl(36, 1, 0, 0, 0) != 0:  # PR_SET_CHILD_SUBREAPER
+            error = ctypes.get_errno()
+            raise OSError(error, os.strerror(error))
 
 
 def supervise(
@@ -403,11 +472,23 @@ def supervise(
     group = list(parse_id(deployment.group_id))
     children: dict[int, WorkerProcess] = {}
     last_error = None
+    if engine is not None:
+        reap_orphaned_workers()
     try:
+        local_errors: dict[int, str] = {}
         while True:
+            for epoch, child in list(children.items()):
+                try:
+                    if child.reconcile(control):
+                        del children[epoch]
+                    local_errors.pop(epoch, None)
+                except (ControlUnavailable, OSError, ValueError) as error:
+                    if local_errors.get(epoch) != str(error):
+                        local_errors[epoch] = str(error)
+                        print(
+                            f"Plait deployment for epoch {epoch}: {error}", flush=True
+                        )
             try:
-                for child in children.values():
-                    child.report_exit(control)
                 latest = control.request("placement", group=group)["placement"][
                     "latest"
                 ]
@@ -435,25 +516,24 @@ def supervise(
                                 and host is not None
                                 and host in placement.devices
                             ):
-                                grant = next(
+                                grants = [
                                     grant
                                     for grant in view["grants"]
                                     if bytes(grant["device"]["node"]).hex() == host
-                                )
+                                ]
+                                drain_marker = None
+                                if host == next(iter(placement.devices)):
+                                    drain_marker = (
+                                        state / f"{placement.version_text}.drain"
+                                    )
                                 process = engine.start(
                                     deployment, placement, host, state
                                 )
                                 children[epoch] = WorkerProcess(
                                     process,
-                                    {
-                                        "id": operation_id(),
-                                        "action": {
-                                            "ReportFailure": {
-                                                "grant": grant,
-                                                "fault": "Device",
-                                            }
-                                        },
-                                    },
+                                    placement,
+                                    grants,
+                                    drain_marker,
                                 )
                             if route and router is not None:
                                 router.reconcile(control, placement, phase)
@@ -466,7 +546,7 @@ def supervise(
             time.sleep(0.5)
     finally:
         for child in children.values():
-            if child.process.poll() is None:
+            if not child.gone():
                 child.signal(signal.SIGTERM)
         for child in children.values():
             try:
