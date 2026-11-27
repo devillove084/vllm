@@ -93,6 +93,18 @@ class PlaitCommunicator(DeviceCommunicatorBase):
             dst = (self.rank_in_group + 1) % self.world_size
         self.pynccl_comm.send(tensor.contiguous(), dst)
 
+    @property
+    def failed(self) -> bool:
+        return getattr(self.pynccl_comm.comm, "peer_failed", False) is True
+
+    def report_execution_failure(self) -> None:
+        comm = self.pynccl_comm.comm
+        report = getattr(comm, "report_execution_failure", None)
+        if report is None:
+            self.pynccl_comm.nccl.ncclCommAbort(comm)
+        else:
+            report()
+
     def recv(
         self, size: torch.Size, dtype: torch.dtype, src: int | None = None
     ) -> torch.Tensor:

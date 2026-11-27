@@ -1064,7 +1064,23 @@ class WorkerProc:
     ) -> None:
         """Execute one RPC in a separate frame from the dequeue loop."""
         method, args, kwargs, output_rank = rpc_request
+        plait_comm = None
+        if (
+            envs.VLLM_USE_PLAIT
+            and method in ("execute_model", "sample_tokens", "execute_dummy_batch")
+            and model_parallel_is_initialized()
+        ):
+            from vllm.distributed.device_communicators.plait_communicator import (
+                PlaitCommunicator,
+            )
+
+            communicator = get_tp_group().device_communicator
+            if isinstance(communicator, PlaitCommunicator):
+                plait_comm = communicator
+
         try:
+            if plait_comm is not None and plait_comm.failed:
+                raise RuntimeError("Plait tensor-parallel communicator has failed")
             if isinstance(method, str):
                 func = getattr(self.worker, method)
             elif isinstance(method, bytes):
@@ -1079,6 +1095,8 @@ class WorkerProc:
             if hasattr(e, "add_note"):
                 e.add_note(traceback.format_exc())
             logger.exception("WorkerProc hit an exception.")
+            if plait_comm is not None and not plait_comm.failed:
+                plait_comm.report_execution_failure()
             # enqueue_output converts the exception to a FAILURE response
             # containing its string representation before transport.
             if output_rank is None or self.rank == output_rank:
