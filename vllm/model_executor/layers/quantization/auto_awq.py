@@ -227,10 +227,14 @@ class AutoAWQConfig(QuantizationConfig):
 
     @classmethod
     def get_supported_act_dtypes(cls) -> list[torch.dtype]:
+        if envs.VLLM_PLAIT_W4_LIBRARY:
+            return [torch.half]
         return [torch.half, torch.bfloat16]
 
     @classmethod
     def get_min_capability(cls) -> int:
+        if envs.VLLM_PLAIT_W4_LIBRARY:
+            return 0
         return 75
 
     @classmethod
@@ -298,6 +302,11 @@ class AutoAWQConfig(QuantizationConfig):
                 match_mode="substring",
             ):
                 return UnquantizedLinearMethod()
+
+            if envs.VLLM_PLAIT_W4_LIBRARY:
+                from .plait_awq import PlaitAWQLinearMethod
+
+                return PlaitAWQLinearMethod(self)
 
             # On CPU and XPU, use the Marlin linear method which uses
             # choose_mp_linear_kernel to select the best available kernel

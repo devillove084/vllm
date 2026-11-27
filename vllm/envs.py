@@ -21,6 +21,8 @@ if TYPE_CHECKING:
     VLLM_NCCL_SO_PATH: str | None = None
     VLLM_USE_PLAIT: bool = False
     VLLM_PLAIT_TP_GROUP_CONFIG: str | None = None
+    VLLM_PLAIT_W4_LIBRARY: str | None = None
+    VLLM_PLAIT_W4_ACTIVATION_BITS: int = 8
     LD_LIBRARY_PATH: str | None = None
     VLLM_ROCM_SLEEP_MEM_CHUNK_SIZE: int = 256
     LOCAL_RANK: int = 0
@@ -749,6 +751,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_NCCL_SO_PATH": lambda: os.environ.get("VLLM_NCCL_SO_PATH", None),
     "VLLM_USE_PLAIT": lambda: os.getenv("VLLM_USE_PLAIT", "0") == "1",
     "VLLM_PLAIT_TP_GROUP_CONFIG": lambda: os.getenv("VLLM_PLAIT_TP_GROUP_CONFIG"),
+    "VLLM_PLAIT_W4_LIBRARY": lambda: os.getenv("VLLM_PLAIT_W4_LIBRARY"),
+    "VLLM_PLAIT_W4_ACTIVATION_BITS": lambda: int(
+        os.getenv("VLLM_PLAIT_W4_ACTIVATION_BITS", "8")
+    ),
     # when `VLLM_NCCL_SO_PATH` is not set, vllm will try to find the nccl
     # library file in the locations specified by `LD_LIBRARY_PATH`
     "LD_LIBRARY_PATH": lambda: os.environ.get("LD_LIBRARY_PATH", None),
