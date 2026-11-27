@@ -24,7 +24,12 @@ from typing import Any
 
 import psutil
 
-from vllm.entrypoints.serve.plait_version import DRAIN_PATH, ROLE_HEADER, VERSION_HEADER
+from vllm.entrypoints.serve.plait_version import (
+    DRAIN_PATH,
+    GROUP_ROLES,
+    ROLE_HEADER,
+    VERSION_HEADER,
+)
 
 
 class ControlUnavailable(RuntimeError):
@@ -224,10 +229,13 @@ class Engine:
     device_env: str
     args: list[str]
     env: dict[str, str]
+    api_role: str = "aggregated"
 
     def __post_init__(self) -> None:
         if not self.argv or not self.model or not self.device_env:
             raise ValueError("engine needs an executable, model and device mask")
+        if self.api_role not in GROUP_ROLES:
+            raise ValueError("expected an aggregated, prefill or decode API role")
         reserved = {
             "--host",
             "--port",
@@ -352,21 +360,21 @@ class Engine:
         # A surviving engine owns its launch lock across supervisor restarts.
         with descriptor.with_suffix(".lock").open("a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            descriptor.write_text(
-                json.dumps(
-                    placement.descriptor(
-                        host, deployment.seeds, deployment.compute_calibration
-                    )
-                ),
-                encoding="utf-8",
+            binding = placement.descriptor(
+                host, deployment.seeds, deployment.compute_calibration
             )
+            if self.api_role != "aggregated":
+                binding["api_role"] = self.api_role
+            descriptor.write_text(json.dumps(binding), encoding="utf-8")
             return subprocess.Popen(
                 command, env=env, start_new_session=True, pass_fds=(lock.fileno(),)
             )
 
 
-def versioned_status(placement: Placement, path: str, status: int) -> bool:
-    headers = {VERSION_HEADER: placement.version_text, ROLE_HEADER: "aggregated"}
+def versioned_status(
+    placement: Placement, path: str, status: int, *, role: str = "aggregated"
+) -> bool:
+    headers = {VERSION_HEADER: placement.version_text, ROLE_HEADER: role}
     try:
         with closing(
             HTTPConnection(placement.api_address, placement.api_port, 2)
@@ -450,6 +458,7 @@ class WorkerProcess:
     placement: Placement
     grants: list[dict]
     drain_marker: Path | None
+    api_role: str = "aggregated"
     closing: bool = False
     pending: dict | None = None
     release_index: int = 0
@@ -495,7 +504,9 @@ class WorkerProcess:
                 )
             elif phase == "Draining" and self.drain_marker is not None:
                 self.drain_marker.touch(exist_ok=True)
-                if versioned_status(self.placement, DRAIN_PATH, 204):
+                if versioned_status(
+                    self.placement, DRAIN_PATH, 204, role=self.api_role
+                ):
                     self.apply(control, {"Revoke": version})
             elif phase in ("Revoked", "Retired"):
                 if not self.gone():
@@ -599,6 +610,7 @@ def supervise(
                                     placement,
                                     grants,
                                     drain_marker,
+                                    api_role=engine.api_role,
                                 )
                             if route and router is not None:
                                 router.reconcile(control, placement, phase)
@@ -641,6 +653,10 @@ def main() -> None:
         if args.host_id not in deployment.hosts:
             parser.error("--host-id must be present in the deployment")
         engine = Engine(**json.loads(args.engine.read_text(encoding="utf-8")))
+        if engine.api_role != "aggregated" and args.routes is not None:
+            parser.error(
+                "--routes publishes one aggregate group. Activate P/D groups as a set."
+            )
         args.state_dir.mkdir(parents=True, exist_ok=True)
     control = Control(args.control_bin, args.control_listen, deployment.seeds)
 

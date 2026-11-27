@@ -442,6 +442,57 @@ class CalibrationTest(unittest.TestCase):
 
 
 class DirectoryTest(unittest.TestCase):
+    def test_native_pd_requires_both_ends_of_one_active_set(self):
+        groups = [bytes([index] * 16).hex() for index in (1, 2, 3)]
+        versions = [f"{group}@1" for group in groups]
+        document = {
+            "model": "test",
+            "revision": 2,
+            "aggregated": [{"url": "http://127.0.0.1:8100", "version": versions[0]}],
+            "paths": [
+                {
+                    "prefill": {
+                        "url": "http://127.0.0.1:8101",
+                        "version": versions[1],
+                        "kv_host": "127.0.0.1",
+                        "kv_port": 7952,
+                    },
+                    "decode": {"url": "http://127.0.0.1:8102", "version": versions[2]},
+                }
+            ],
+        }
+        keys = [list(bytes.fromhex(group)) for group in groups]
+        control = Mock()
+        control.request.side_effect = [
+            {"result": {"Ok": {"ActiveSet": list(zip(keys, epochs, strict=True))}}}
+            for epochs in ((1, None, None), (None, 1, 1), (None, 1, None))
+        ]
+        with tempfile.TemporaryDirectory() as folder:
+            config = Path(folder) / "routes.json"
+            config.write_text(json.dumps(document))
+            directory = disaggregate.NativeDirectory("test", control, config)
+            directory.refresh()
+            self.assertEqual(
+                [route.role for route in directory.routes()[1]], ["aggregated"]
+            )
+            directory.refresh()
+            [route] = directory.routes()[1]
+            self.assertEqual(route.prefill.version, versions[1])
+            self.assertEqual(route.decode.version, versions[2])
+            self.assertFalse(route.prefill_lease)
+            directory.refresh()
+            self.assertEqual(directory.routes(), ("test", []))
+            request = control.request.call_args.args[0]
+            self.assertEqual(
+                request["operation"]["action"], {"ObserveActiveSet": {"groups": keys}}
+            )
+            config.write_text(json.dumps({**document, "revision": 1}))
+            directory.refresh()
+            self.assertEqual(control.request.call_count, 3)
+            config.write_text(json.dumps({**document, "paths": []}))
+            with self.assertRaisesRegex(ValueError, "new revision"):
+                directory.refresh()
+
     def test_native_route_waits_for_the_active_versions_binding(self):
         group = bytes(16)
 

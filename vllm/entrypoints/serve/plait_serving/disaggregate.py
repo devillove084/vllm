@@ -16,7 +16,7 @@ import signal
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -74,6 +74,7 @@ class Route:
     decode: Endpoint
     kv_host: str
     kv_port: int
+    prefill_lease: bool = True
 
     @classmethod
     def parse(cls, config: dict) -> Route:
@@ -170,12 +171,93 @@ class ControlDirectory:
         try:
             while not stop.is_set():
                 with contextlib.suppress(
-                    ControlError, ValueError, KeyError, TypeError, AttributeError
+                    ControlError,
+                    OSError,
+                    ValueError,
+                    KeyError,
+                    TypeError,
+                    AttributeError,
                 ):
                     self.refresh()
                 stop.wait(DIRECTORY_POLL_SECONDS)
         finally:
             self.control.close()
+
+
+class NativeDirectory(ControlDirectory):
+    """Route only to exact versions present in one ordered group observation."""
+
+    def __init__(self, model: str, control: Control, path: Path) -> None:
+        super().__init__(model, control)
+        self.path = path
+        self.configured: list[Destination] = []
+
+    def refresh(self) -> None:
+        document = json.loads(self.path.read_text(encoding="utf-8"))
+        model, paths = parse_directory(document)
+        revision = document["revision"]
+        if model != self.model or type(revision) is not int or revision < 1:
+            raise ValueError("unexpected native route directory")
+        if revision < self.revision:
+            return
+        if revision == self.revision and paths != self.configured:
+            raise ValueError("native route changes require a new revision")
+
+        bindings = [
+            (
+                path,
+                (path.prefill.version, path.decode.version)
+                if isinstance(path, Route)
+                else (path.version,),
+            )
+            for path in paths
+        ]
+        groups = sorted(
+            {
+                version.split("@", 1)[0]
+                for _, required in bindings
+                for version in required
+            }
+        )
+        sent = time.monotonic()
+        active = self.observe(groups) if groups else set()
+        with self.lock:
+            self.revision = revision
+            self.configured = paths
+            self.paths = [
+                replace(path, prefill_lease=False) if isinstance(path, Route) else path
+                for path, required in bindings
+                if all(version in active for version in required)
+            ]
+            self.until = sent + DIRECTORY_READ_TTL
+
+    def observe(self, groups: list[str]) -> set[str]:
+        result = self.control.request(
+            {
+                "request": "apply",
+                "operation": {
+                    "id": self.control.next_operation_id(),
+                    "action": {
+                        "ObserveActiveSet": {
+                            "groups": [list(bytes.fromhex(group)) for group in groups],
+                        }
+                    },
+                },
+            }
+        )["result"]
+        if "Ok" not in result:
+            raise ControlError("Plait rejected the active group observation")
+        epochs = result["Ok"]["ActiveSet"]
+        if [bytes(group).hex() for group, _ in epochs] != groups or any(
+            epoch is not None and (type(epoch) is not int or epoch < 1)
+            for _, epoch in epochs
+        ):
+            raise ControlError("Plait returned a different active group set")
+        return {
+            f"{group}@{epoch}"
+            for group, (_, epoch) in zip(groups, epochs)
+            if epoch is not None
+        }
 
 
 def json_object(raw: bytes) -> dict:
@@ -243,7 +325,10 @@ def transfer_descriptor(
     return params
 
 
-def release_transfer(endpoint: Endpoint, token: str) -> None:
+def release_transfer(route: Route, token: str) -> None:
+    if not route.prefill_lease:
+        return
+    endpoint = route.prefill
     headers = {**endpoint.headers(), HANDOFF_HEADER: token}
     with (
         contextlib.suppress(*HTTP_ERRORS),
@@ -292,12 +377,14 @@ def request_prefill(
     ):
         if admission_rejected(response):
             return None
+        if not route.prefill.matches(response):
+            raise UpstreamError("response does not match the admitted prefill group")
         if response.status != 200:
             raise PrefillError(response.status, read_json(response))
         try:
             params = transfer_descriptor(read_json(response), route, ticket)
         except UpstreamError:
-            release_transfer(route.prefill, token)
+            release_transfer(route, token)
             raise
     return Transfer(request_id, token, params)
 
@@ -433,10 +520,7 @@ def server(
             ):
                 if admission_rejected(response):
                     return None
-                if any(
-                    response.getheader(key) != value
-                    for key, value in endpoint.headers().items()
-                ):
+                if not endpoint.matches(response):
                     raise UpstreamError(
                         "response does not match the admitted aggregate group"
                     )
@@ -455,7 +539,7 @@ def server(
 
             budget = deadline - time.monotonic()
             if budget <= 0:
-                release_transfer(route.prefill, transfer.token)
+                release_transfer(route, transfer.token)
                 raise UpstreamError("request deadline elapsed before decode")
             with (
                 contextlib.closing(route.decode.connect(budget)) as connection,
@@ -468,11 +552,15 @@ def server(
                 ) as response,
             ):
                 if admission_rejected(response):
-                    release_transfer(route.prefill, transfer.token)
+                    release_transfer(route, transfer.token)
                     return None
+                if not route.decode.matches(response):
+                    raise UpstreamError(
+                        "response does not match the admitted decode group"
+                    )
                 completed = self.write_decode(response)
                 if completed:
-                    release_transfer(route.prefill, transfer.token)
+                    release_transfer(route, transfer.token)
             return completed
 
         def route_replay(
@@ -534,7 +622,7 @@ def server(
                     finally:
                         # The store keeps prompt pages past this handoff lease.
                         if isinstance(route, Route) and transfer is not None:
-                            release_transfer(route.prefill, transfer.token)
+                            release_transfer(route, transfer.token)
                 if not handed_off:
                     time.sleep(
                         min(
@@ -629,10 +717,7 @@ def server(
                     if admission_rejected(response):
                         return None
                     headers = endpoint.headers()
-                    if any(
-                        response.getheader(key) != value
-                        for key, value in headers.items()
-                    ):
+                    if not endpoint.matches(response):
                         raise ReplayMismatch(
                             "response does not match the admitted serving group"
                         )
@@ -742,21 +827,45 @@ def main() -> None:
         "--routes", type=Path, help="JSON file with versioned P/D paths"
     )
     source.add_argument(
+        "--native-routes",
+        type=Path,
+        help="engine route directory using native group epochs",
+    )
+    source.add_argument(
         "--model", help="model alias published in the replicated directory"
     )
     parser.add_argument("--control-bin", default="plait-node")
     parser.add_argument("--control-peer", action="append", default=[])
+    parser.add_argument("--control-seed", action="append", default=[])
     parser.add_argument("--control-listen", default="127.0.0.1:0")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8192)
-    parser.add_argument("--kv-transport", choices=("nixl", "plait"), default="nixl")
+    parser.add_argument("--kv-transport", choices=("nixl", "plait"))
     parser.add_argument("--load-listen", help="private IP:port for P/D demand counters")
     parser.add_argument("--timeout", type=float, default=120.0)
     args = parser.parse_args()
     if not 0 < args.port < 65536 or not 0 < args.timeout < float("inf"):
         parser.error("port and timeout must be valid")
-    if args.routes is None and not args.control_peer:
+    if args.native_routes is not None:
+        if bool(args.control_peer) == bool(args.control_seed):
+            parser.error(
+                "--native-routes requires either --control-peer or --control-seed"
+            )
+        if args.kv_transport not in (None, "plait"):
+            parser.error("--native-routes uses the shared PlaitKvConnector page store")
+        args.kv_transport = "plait"
+        try:
+            args.model, _ = parse_directory(
+                json.loads(args.native_routes.read_text(encoding="utf-8"))
+            )
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            parser.error(str(error))
+    elif args.control_seed:
+        parser.error("--control-seed requires --native-routes")
+    elif args.routes is None and not args.control_peer:
         parser.error("--model requires at least one --control-peer")
+    if args.kv_transport is None:
+        args.kv_transport = "nixl"
     load = None
     load_context = contextlib.nullcontext()
     if args.load_listen is not None:
@@ -798,8 +907,18 @@ def route_source(args: argparse.Namespace):
     if args.routes is not None:
         yield Directory(args.routes)
         return
-    directory = ControlDirectory(
-        args.model, Control(args.control_bin, args.control_peer, args.control_listen)
+    native = args.native_routes is not None
+    control = Control(
+        args.control_bin,
+        args.control_peer,
+        args.control_listen,
+        seeds=args.control_seed,
+        command="group" if native else "serving",
+    )
+    directory = (
+        NativeDirectory(args.model, control, args.native_routes)
+        if native
+        else ControlDirectory(args.model, control)
     )
     stop = threading.Event()
     watcher = threading.Thread(

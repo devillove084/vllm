@@ -16,6 +16,7 @@ from vllm.logger import init_logger
 VERSION_HEADER = "X-Plait-Group-Version"
 ROLE_HEADER = "X-Plait-Group-Role"
 DRAIN_PATH = "/_plait/drain"
+GROUP_ROLES = ("aggregated", "prefill", "decode")
 logger = init_logger(__name__)
 _VERSION = VERSION_HEADER.lower().encode()
 _ROLE = ROLE_HEADER.lower().encode()
@@ -37,9 +38,12 @@ class NativeGroupHeaders:
                 "group middleware requires one valid execution group version"
             )
         self.version = groups[0]["version"]
+        self.role = deployment.get("api_role", "aggregated")
+        if self.role not in GROUP_ROLES:
+            raise ValueError("expected an aggregated, prefill or decode API role")
         self.response_headers = [
             (_VERSION, self.version.encode("ascii")),
-            (_ROLE, b"aggregated"),
+            (_ROLE, self.role.encode("ascii")),
         ]
         self.drain_marker = Path(descriptor).with_suffix(".drain")
         self.draining = False
@@ -69,10 +73,16 @@ class NativeGroupHeaders:
             await self.app(scope, receive, send)
             return
         versions = [value for key, value in scope["headers"] if key.lower() == _VERSION]
-        response_headers = {VERSION_HEADER: self.version, ROLE_HEADER: "aggregated"}
+        roles = [value for key, value in scope["headers"] if key.lower() == _ROLE]
+        response_headers = {VERSION_HEADER: self.version, ROLE_HEADER: self.role}
+        mismatch = None
         if versions and versions != [self.response_headers[0][1]]:
+            mismatch = "execution group version does not match"
+        elif roles and roles != [self.response_headers[1][1]]:
+            mismatch = "execution group role does not match"
+        if mismatch is not None:
             response = JSONResponse(
-                {"error": {"message": "execution group version does not match"}},
+                {"error": {"message": mismatch}},
                 status_code=409,
                 headers=response_headers | {"X-Plait-Admission": "rejected"},
             )

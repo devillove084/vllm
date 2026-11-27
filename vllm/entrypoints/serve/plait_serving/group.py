@@ -213,6 +213,11 @@ class Endpoint:
     def headers(self) -> dict[str, str]:
         return {VERSION_HEADER: self.version, ROLE_HEADER: self.role}
 
+    def matches(self, response: http.client.HTTPResponse) -> bool:
+        return all(
+            response.getheader(key) == value for key, value in self.headers().items()
+        )
+
     @property
     def epoch(self) -> int:
         return int(self.version.rsplit("@", 1)[1])
@@ -231,11 +236,7 @@ def probe_endpoint(endpoint: Endpoint, timeout: float) -> str | None:
         with contextlib.closing(endpoint.connect(min(2.0, timeout))) as connection:
             connection.request("GET", "/health", headers=endpoint.headers())
             with connection.getresponse() as response:
-                if (
-                    response.status == 200
-                    and response.getheader(VERSION_HEADER) == endpoint.version
-                    and response.getheader(ROLE_HEADER) == endpoint.role
-                ):
+                if response.status == 200 and endpoint.matches(response):
                     capability = response.getheader(KV_RESUME_HEADER)
                     if capability in (
                         serving_launch.GREEDY_KV_RESUME,

@@ -197,6 +197,33 @@ class TestPlaitDeployment(unittest.TestCase):
                 assert response.status_code == 409
                 assert response.headers["X-Plait-Admission"] == "rejected"
 
+    def test_engine_binds_the_api_role_to_the_group_version(self):
+        async def app(scope, receive, send):
+            await Response(status_code=200)(scope, receive, send)
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "group.json"
+            descriptor = self.placement.descriptor(self.first, self.config.seeds)
+            path.write_text(json.dumps({**descriptor, "api_role": "prefill"}))
+            with patch.dict(
+                "os.environ",
+                {"VLLM_USE_PLAIT": "1", "VLLM_PLAIT_TP_GROUP_CONFIG": str(path)},
+            ):
+                engine = TestClient(NativeGroupHeaders(app))
+                headers = {VERSION_HEADER: self.placement.version_text}
+                response = engine.post(
+                    "/v1/completions",
+                    headers={**headers, "X-Plait-Group-Role": "decode"},
+                )
+                assert response.status_code == 409
+                assert response.headers["X-Plait-Admission"] == "rejected"
+                response = engine.post(
+                    "/v1/completions",
+                    headers={**headers, "X-Plait-Group-Role": "prefill"},
+                )
+                assert response.status_code == 200
+                assert response.headers["X-Plait-Group-Role"] == "prefill"
+
     def test_worker_releases_only_after_process_group_exit(self):
         with tempfile.TemporaryDirectory() as directory:
             marker = Path(directory) / "group.drain"
