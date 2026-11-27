@@ -9,6 +9,10 @@ from vllm.distributed.device_communicators.base_device_communicator import (
 )
 from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
 from vllm.distributed.plait_rendezvous import CommittedTpGroup
+from vllm.logger import init_logger
+from vllm.utils.network_utils import get_ip
+
+logger = init_logger(__name__)
 
 
 class PlaitCommunicator(DeviceCommunicatorBase):
@@ -27,6 +31,31 @@ class PlaitCommunicator(DeviceCommunicatorBase):
         )
         if self.pynccl_comm.disabled:
             raise RuntimeError(f"Plait communicator {unique_name} is disabled")
+        if committed_group is not None and committed_group.compute_calibration is not None:
+            self._publish_compute_calibration(committed_group)
+
+    def _publish_compute_calibration(self, group: CommittedTpGroup) -> None:
+        calibration = group.compute_calibration
+        assert calibration is not None
+        comm = self.pynccl_comm.comm
+        address = get_ip()
+        try:
+            previous = comm.compute_rate_revision(address, group.seeds, calibration.id)
+            speed = calibration.measure(self.device)
+            revision = comm.publish_compute_rate(
+                address, group.seeds, calibration.id, previous, speed
+            )
+        except (AttributeError, OSError, RuntimeError, ValueError) as exc:
+            logger.warning(
+                "Skipping Plait compute calibration %s: %s", calibration.id, exc
+            )
+            return
+        logger.info(
+            "Plait compute calibration %s at revision %d: %d operations/s",
+            calibration.id,
+            revision,
+            speed,
+        )
 
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
         return self.pynccl_comm.all_reduce(input_.contiguous())

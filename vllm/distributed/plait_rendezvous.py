@@ -10,6 +10,7 @@ from torch.distributed import DistStoreError, PrefixStore, TCPStore
 from torch.distributed.constants import default_pg_timeout
 
 from vllm import envs
+from vllm.distributed.plait_calibration import GemmCalibration
 from vllm.distributed.utils import create_tcp_store
 
 if TYPE_CHECKING:
@@ -21,6 +22,7 @@ class CommittedTpGroup:
     version: str
     seeds: list[str]
     devices: list[tuple[str, int]]
+    compute_calibration: GemmCalibration | None = None
 
     @classmethod
     def load(cls, path: str, ranks: list[int], slot: int) -> "CommittedTpGroup":
@@ -36,7 +38,10 @@ class CommittedTpGroup:
             raise ValueError(
                 f"Plait TP device binding does not match worker {ranks[slot]}"
             )
-        return cls(group["version"], config["seeds"], devices)
+        calibration = group.get("compute_calibration")
+        if calibration is not None:
+            calibration = GemmCalibration(**calibration)
+        return cls(group["version"], config["seeds"], devices, calibration)
 
 
 def _open_store(config: "ParallelConfig", *, is_master: bool) -> TCPStore:
