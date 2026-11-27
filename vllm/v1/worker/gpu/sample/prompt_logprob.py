@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
@@ -16,6 +17,12 @@ from vllm.v1.worker.gpu.sample.logprob import (
     compute_token_logprobs,
     compute_topk_scores,
 )
+from vllm.v1.worker.gpu.sample.sharded_prompt_logprob import (
+    compute_sharded_prompt_scores,
+)
+
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.logits_processor import PromptLogitsShard
 
 CHUNK_SIZE = 1024
 
@@ -129,6 +136,7 @@ class PromptLogprobsWorker:
         *,
         submit_logits_fn: Callable[[torch.Tensor], Callable[[], torch.Tensor]]
         | None = None,
+        logits_shard: "PromptLogitsShard | None" = None,
     ) -> dict[str, LogprobsTensors]:
         idx_mapping_np = input_batch.idx_mapping_np
         needs_prompt_logprobs = self.uses_prompt_logprobs[idx_mapping_np]
@@ -171,6 +179,7 @@ class PromptLogprobsWorker:
                 max_num_prompt_logprobs,
                 self.logprobs_mode,
                 submit_logits_fn=submit_logits_fn,
+                logits_shard=logits_shard,
             )
         )
 
@@ -291,6 +300,7 @@ def compute_prompt_logprobs_with_chunking(
     *,
     submit_logits_fn: Callable[[torch.Tensor], Callable[[], torch.Tensor]]
     | None = None,
+    logits_shard: "PromptLogitsShard | None" = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     # Since materializing the full prompt logits can take too much memory,
     # we compute it in chunks.
@@ -300,35 +310,51 @@ def compute_prompt_logprobs_with_chunking(
     logits_mode = logprobs_mode in ("raw_logits", "processed_logits")
     prompt_token_ids = prompt_token_ids.to(torch.int64)
     num_rows = prompt_token_ids.shape[0]
+    if logits_shard is not None and not (
+        0 <= num_prompt_logprobs <= 32 and num_prompt_logprobs < logits_shard.vocab_size
+    ):
+        logits_shard = None
     pending = (
         submit_logits_fn(prompt_hidden_states[:CHUNK_SIZE])
-        if submit_logits_fn is not None and num_rows > CHUNK_SIZE
+        if logits_shard is None
+        and submit_logits_fn is not None
+        and num_rows > CHUNK_SIZE
         else None
     )
     for start_idx in range(0, num_rows, CHUNK_SIZE):
         end_idx = start_idx + CHUNK_SIZE
-        if pending is None:
-            prompt_logits = logits_fn(prompt_hidden_states[start_idx:end_idx])
-        else:
-            assert submit_logits_fn is not None
-            wait = pending
-            pending = (
-                submit_logits_fn(prompt_hidden_states[end_idx : end_idx + CHUNK_SIZE])
-                if end_idx < num_rows
-                else None
+        hidden = prompt_hidden_states[start_idx:end_idx]
+        targets = prompt_token_ids[start_idx:end_idx]
+        if logits_shard is not None:
+            result = compute_sharded_prompt_scores(
+                logits_shard,
+                hidden,
+                targets,
+                num_prompt_logprobs,
+                logits_mode=logits_mode,
             )
-            prompt_logits = wait()
-        requested_num = (
-            prompt_logits.shape[-1]
-            if num_prompt_logprobs == -1
-            else num_prompt_logprobs
-        )
-        result = compute_topk_scores(
-            prompt_logits,
-            requested_num,
-            prompt_token_ids[start_idx:end_idx],
-            logits_mode=logits_mode,
-        )
+        else:
+            if pending is None:
+                prompt_logits = logits_fn(hidden)
+            else:
+                assert submit_logits_fn is not None
+                wait = pending
+                pending = (
+                    submit_logits_fn(
+                        prompt_hidden_states[end_idx : end_idx + CHUNK_SIZE]
+                    )
+                    if end_idx < num_rows
+                    else None
+                )
+                prompt_logits = wait()
+            requested_num = (
+                prompt_logits.shape[-1]
+                if num_prompt_logprobs == -1
+                else num_prompt_logprobs
+            )
+            result = compute_topk_scores(
+                prompt_logits, requested_num, targets, logits_mode=logits_mode
+            )
         token_ids.append(result.logprob_token_ids)
         scores.append(result.logprobs)
         ranks.append(result.selected_token_ranks)

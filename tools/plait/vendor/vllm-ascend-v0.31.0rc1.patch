@@ -58,11 +58,16 @@ index f5dd4d4..0a3e373 100644
 diff --git a/vllm_ascend/ops/vocab_parallel_embedding.py b/vllm_ascend/ops/vocab_parallel_embedding.py
 --- a/vllm_ascend/ops/vocab_parallel_embedding.py
 +++ b/vllm_ascend/ops/vocab_parallel_embedding.py
-@@ -549,3 +549,8 @@ class AscendLogitsProcessor(LogitsProcessor):
+@@ -549,3 +549,13 @@ class AscendLogitsProcessor(LogitsProcessor):
 +    def prompt_logits_submitter(self, lm_head: AscendParallelLMHead):
 +        if lm_head.parallel_mode is not VocabParallelMode.STANDARD:
 +            return None
 +        return self._standard_tp_prompt_logits_submitter(lm_head)
++
++    def prompt_logits_shard(self, lm_head: AscendParallelLMHead):
++        if lm_head.parallel_mode is not VocabParallelMode.STANDARD:
++            return None
++        return self._standard_tp_prompt_logits_shard(lm_head)
 +
      def _apply_head(
          self,

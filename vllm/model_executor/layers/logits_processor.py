@@ -3,7 +3,9 @@
 """A layer that compute logits from hidden_stats."""
 
 from collections.abc import Callable
+from dataclasses import dataclass
 from functools import cache
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
@@ -23,7 +25,21 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.platforms import current_platform
 from vllm.utils.flashinfer import has_flashinfer
 
+if TYPE_CHECKING:
+    from vllm.distributed.device_communicators.plait_communicator import (
+        PlaitCommunicator,
+    )
+
 logger = init_logger(__name__)
+
+
+@dataclass(frozen=True)
+class PromptLogitsShard:
+    project: Callable[[torch.Tensor], torch.Tensor]
+    communicator: "PlaitCommunicator"
+    vocab_size: int
+    shard_width: int
+    first_token: int
 
 
 @cache
@@ -130,18 +146,8 @@ class LogitsProcessor(PluggableLayer):
     def _standard_tp_prompt_logits_submitter(
         self, lm_head: VocabParallelEmbedding
     ) -> Callable[[torch.Tensor], Callable[[], torch.Tensor]] | None:
-        from vllm.distributed.device_communicators.plait_communicator import (
-            PlaitCommunicator,
-        )
-        from vllm.distributed.parallel_state import get_tp_group
-
-        if self.logits_as_input or lm_head.tp_size <= 1 or not self.use_all_gather:
-            return None
-        comm = get_tp_group().device_communicator
-        if (
-            not isinstance(comm, PlaitCommunicator)
-            or not comm.supports_all_gather_requests
-        ):
+        comm = self._standard_tp_communicator(lm_head)
+        if comm is None or not comm.supports_all_gather_requests:
             return None
 
         def submit(hidden_states: torch.Tensor) -> Callable[[], torch.Tensor]:
@@ -161,6 +167,50 @@ class LogitsProcessor(PluggableLayer):
             return finish
 
         return submit
+
+    def _standard_tp_communicator(
+        self, lm_head: VocabParallelEmbedding
+    ) -> "PlaitCommunicator | None":
+        from vllm.distributed.device_communicators.plait_communicator import (
+            PlaitCommunicator,
+        )
+        from vllm.distributed.parallel_state import get_tp_group
+
+        if self.logits_as_input or lm_head.tp_size <= 1 or not self.use_all_gather:
+            return None
+        comm = get_tp_group().device_communicator
+        return comm if isinstance(comm, PlaitCommunicator) else None
+
+    def prompt_logits_shard(
+        self, lm_head: VocabParallelEmbedding
+    ) -> PromptLogitsShard | None:
+        if type(self) is not LogitsProcessor:
+            return None
+        return self._standard_tp_prompt_logits_shard(lm_head)
+
+    def _standard_tp_prompt_logits_shard(
+        self, lm_head: VocabParallelEmbedding
+    ) -> PromptLogitsShard | None:
+        comm = self._standard_tp_communicator(lm_head)
+        width = lm_head.num_embeddings_per_partition
+        if (
+            comm is None
+            or self.soft_cap is not None
+            or self.scale != 1.0
+            or lm_head.num_added_embeddings != 0
+            or comm.world_size != lm_head.tp_size
+            or self.org_vocab_size != lm_head.org_vocab_size
+            or not (comm.world_size - 1) * width < self.org_vocab_size
+            or self.org_vocab_size > 2**24
+        ):
+            return None
+        return PromptLogitsShard(
+            project=lambda hidden: self._apply_head(lm_head, hidden, None),
+            communicator=comm,
+            vocab_size=self.org_vocab_size,
+            shard_width=width,
+            first_token=lm_head.shard_indices.org_vocab_start_index,
+        )
 
     def _gather_logits(self, logits: torch.Tensor) -> torch.Tensor:
         """gather/all-gather the logits tensor across model parallel group."""

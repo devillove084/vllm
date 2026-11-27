@@ -171,6 +171,20 @@ For vLLM Ascend 0.31.0rc1, apply the fork's
 The patch checks each stage's own MC2 and TP ranks before reusing the
 Plait TP group.
 
+Set `VLLM_PLAIT_SHARDED_PROMPT_LOGPROBS=1` on every TP worker to enable
+sharded prompt scoring for Qwen3 with the V2 runner and standard vocabulary
+parallelism. It supports `prompt_logprobs` counts from zero through 32 in
+both raw-logit and normalized-logprob modes. The setting defaults to off.
+The Ascend plugin patch also enables this path for its standard TP layout.
+
+Each worker projects its vocabulary shard, exchanges top candidates and
+normalization statistics with AllGather, and sums the target token's rank
+contributions with AllReduce. Rows with nonfinite logits or ties among the
+selected candidates or at their cutoff use the dense scorer. Requests for
+the entire vocabulary use the dense path. Raw logits retain their
+projection precision. Normalized scores combine FP32 partial sums across
+shards. [TLA+ model](../../tools/plait/serving/specs/PlaitShardedPromptScores.tla)
+
 For disaggregated prefill, use `PlaitKvConnector` on both engines and a
 Plait KV store that supports `PLAITKV3` range requests. The two engines
 share a model namespace, logical KV block size and KV dtype. Each engine

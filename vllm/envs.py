@@ -21,6 +21,7 @@ if TYPE_CHECKING:
     VLLM_NCCL_SO_PATH: str | None = None
     VLLM_USE_PLAIT: bool = False
     VLLM_PLAIT_PROMPT_LOGPROBS_OVERLAP: bool = False
+    VLLM_PLAIT_SHARDED_PROMPT_LOGPROBS: bool = False
     VLLM_PLAIT_TP_GROUP_CONFIG: str | None = None
     VLLM_PLAIT_W4_LIBRARY: str | None = None
     VLLM_PLAIT_W4_ACTIVATION_BITS: int = 8
@@ -753,6 +754,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_USE_PLAIT": lambda: os.getenv("VLLM_USE_PLAIT", "0") == "1",
     "VLLM_PLAIT_PROMPT_LOGPROBS_OVERLAP": lambda: (
         os.getenv("VLLM_PLAIT_PROMPT_LOGPROBS_OVERLAP", "0") == "1"
+    ),
+    "VLLM_PLAIT_SHARDED_PROMPT_LOGPROBS": lambda: (
+        os.getenv("VLLM_PLAIT_SHARDED_PROMPT_LOGPROBS", "0") == "1"
     ),
     "VLLM_PLAIT_TP_GROUP_CONFIG": lambda: os.getenv("VLLM_PLAIT_TP_GROUP_CONFIG"),
     "VLLM_PLAIT_W4_LIBRARY": lambda: os.getenv("VLLM_PLAIT_W4_LIBRARY"),
