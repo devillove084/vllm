@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     VLLM_RINGBUFFER_WARNING_INTERVAL: int = 60
     VLLM_NCCL_SO_PATH: str | None = None
     VLLM_USE_PLAIT: bool = False
+    VLLM_PLAIT_TP_GROUP_CONFIG: str | None = None
     LD_LIBRARY_PATH: str | None = None
     VLLM_ROCM_SLEEP_MEM_CHUNK_SIZE: int = 256
     LOCAL_RANK: int = 0
@@ -747,6 +748,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # by PyTorch contains a bug: https://github.com/NVIDIA/nccl/issues/1234
     "VLLM_NCCL_SO_PATH": lambda: os.environ.get("VLLM_NCCL_SO_PATH", None),
     "VLLM_USE_PLAIT": lambda: os.getenv("VLLM_USE_PLAIT", "0") == "1",
+    "VLLM_PLAIT_TP_GROUP_CONFIG": lambda: os.getenv("VLLM_PLAIT_TP_GROUP_CONFIG"),
     # when `VLLM_NCCL_SO_PATH` is not set, vllm will try to find the nccl
     # library file in the locations specified by `LD_LIBRARY_PATH`
     "LD_LIBRARY_PATH": lambda: os.environ.get("LD_LIBRARY_PATH", None),

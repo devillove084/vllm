@@ -8,6 +8,7 @@ from vllm.distributed.device_communicators.base_device_communicator import (
     DeviceCommunicatorBase,
 )
 from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
+from vllm.distributed.plait_rendezvous import CommittedTpGroup
 
 
 class PlaitCommunicator(DeviceCommunicatorBase):
@@ -18,9 +19,12 @@ class PlaitCommunicator(DeviceCommunicatorBase):
         cpu_group: ProcessGroup,
         device: torch.device,
         unique_name: str,
+        committed_group: CommittedTpGroup | None = None,
     ):
         super().__init__(cpu_group, device, unique_name=unique_name)
-        self.pynccl_comm = PyNcclCommunicator(cpu_group, device, use_peer_group=True)
+        self.pynccl_comm = PyNcclCommunicator(
+            cpu_group, device, use_peer_group=True, committed_group=committed_group
+        )
         if self.pynccl_comm.disabled:
             raise RuntimeError(f"Plait communicator {unique_name} is disabled")
 

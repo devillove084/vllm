@@ -5,6 +5,7 @@
 # ===================== import region =====================
 import contextlib
 import threading
+from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
@@ -25,6 +26,9 @@ from vllm.distributed.utils import StatelessProcessGroup
 from vllm.logger import init_logger
 from vllm.utils.network_utils import get_ip
 from vllm.utils.torch_utils import current_stream
+
+if TYPE_CHECKING:
+    from vllm.distributed.plait_rendezvous import CommittedTpGroup
 
 logger = init_logger(__name__)
 
@@ -128,6 +132,7 @@ class PyNcclCommunicator:
         library_path: str | None = None,
         *,
         use_peer_group: bool = False,
+        committed_group: "CommittedTpGroup | None" = None,
     ):
         """Args:
             group: the process group to work on. If None, it will use the
@@ -155,7 +160,7 @@ class PyNcclCommunicator:
         self.group = group
 
         # if world_size == 1, no need to create communicator
-        if self.world_size == 1 or envs.VLLM_DISABLE_PYNCCL:
+        if (self.world_size == 1 and committed_group is None) or envs.VLLM_DISABLE_PYNCCL:
             self.available = False
             self.disabled = True
             return
@@ -182,8 +187,15 @@ class PyNcclCommunicator:
                 or dist.get_backend(group) != dist.Backend.GLOO
             ):
                 raise ValueError("Plait peer startup requires a Gloo process group")
-            self._init_comm(device, peer_group=group)
-            logger.info_once("vLLM device communication is using Plait peer transport")
+            self._init_comm(device, peer_group=group, committed_group=committed_group)
+            if committed_group is not None:
+                logger.info(
+                    "vLLM joined committed Plait group %s", committed_group.version
+                )
+            else:
+                logger.info_once(
+                    "vLLM device communication is using Plait peer transport"
+                )
             return
 
         if self.rank == 0:
@@ -214,6 +226,7 @@ class PyNcclCommunicator:
         device: int | str | torch.device,
         *,
         peer_group: ProcessGroup | None = None,
+        committed_group: "CommittedTpGroup | None" = None,
     ) -> None:
         """Connect the communicator, then run the one-element warm-up."""
         if isinstance(device, int):
@@ -225,7 +238,15 @@ class PyNcclCommunicator:
         self.device = device
         # nccl communicator and stream will use this device
         with torch.accelerator.device_index(device.index):
-            if peer_group is None:
+            if committed_group is not None:
+                self.comm = self.nccl.join_versioned_group(
+                    get_ip(),
+                    committed_group.seeds,
+                    committed_group.version,
+                    committed_group.devices,
+                    self.rank,
+                )
+            elif peer_group is None:
                 self.comm: ncclComm_t = self.nccl.ncclCommInitRank(
                     self.world_size, self.unique_id, self.rank
                 )

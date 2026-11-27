@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
+from dataclasses import dataclass
 from datetime import timedelta
 from typing import TYPE_CHECKING
 
@@ -13,6 +14,29 @@ from vllm.distributed.utils import create_tcp_store
 
 if TYPE_CHECKING:
     from vllm.config import ParallelConfig
+
+
+@dataclass(frozen=True)
+class CommittedTpGroup:
+    version: str
+    seeds: list[str]
+    devices: list[tuple[str, int]]
+
+    @classmethod
+    def load(cls, path: str, ranks: list[int], slot: int) -> "CommittedTpGroup":
+        """Resolve this worker's TP group against the launcher's device bindings."""
+        with open(path, encoding="utf-8") as file:
+            config = json.load(file)
+        matches = [group for group in config["tp_groups"] if group["ranks"] == ranks]
+        if len(matches) != 1:
+            raise ValueError(f"Expected one committed Plait TP group for ranks {ranks}")
+        group = matches[0]
+        devices = [(host.lower(), ordinal) for host, ordinal in group["devices"]]
+        if len(devices) != len(ranks) or devices[slot][0] != config["host_id"].lower():
+            raise ValueError(
+                f"Plait TP device binding does not match worker {ranks[slot]}"
+            )
+        return cls(group["version"], config["seeds"], devices)
 
 
 def _open_store(config: "ParallelConfig", *, is_master: bool) -> TCPStore:

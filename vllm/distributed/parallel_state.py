@@ -47,7 +47,7 @@ import vllm.envs as envs
 from vllm.distributed.device_communicators.base_device_communicator import (
     DeviceCommunicatorBase,
 )
-from vllm.distributed.plait_rendezvous import plait_worker_store
+from vllm.distributed.plait_rendezvous import CommittedTpGroup, plait_worker_store
 from vllm.distributed.utils import (
     StatelessProcessGroup,
     get_cached_tcp_store_client,
@@ -1511,6 +1511,9 @@ def init_model_parallel_group(
     use_plait = (
         envs.VLLM_USE_PLAIT and group_name in ("tp", "pp") and use_device_communicator
     )
+    binding_path = envs.VLLM_PLAIT_TP_GROUP_CONFIG if group_name == "tp" else None
+    if binding_path is not None and not use_plait:
+        raise ValueError("VLLM_PLAIT_TP_GROUP_CONFIG requires Plait TP communication")
     group = GroupCoordinator(
         group_ranks=group_ranks,
         local_rank=local_rank,
@@ -1520,7 +1523,7 @@ def init_model_parallel_group(
         group_name=group_name,
         use_all2all=use_all2all,
     )
-    if use_plait and group.world_size > 1:
+    if use_plait and (group.world_size > 1 or binding_path is not None):
         from vllm.distributed.device_communicators.plait_communicator import (
             PlaitCommunicator,
         )
@@ -1530,7 +1533,16 @@ def init_model_parallel_group(
         if isinstance(device, int):
             device = torch.device(current_platform.device_type, device)
         try:
-            communicator = PlaitCommunicator(group.cpu_group, device, group.unique_name)
+            binding = None
+            if binding_path is not None:
+                if torch.distributed.get_rank(group.cpu_group) != group.rank_in_group:
+                    raise ValueError("Plait TP logical slot differs from CPU group slot")
+                binding = CommittedTpGroup.load(
+                    binding_path, group.ranks, group.rank_in_group
+                )
+            communicator = PlaitCommunicator(
+                group.cpu_group, device, group.unique_name, binding
+            )
             group.device_communicator = communicator
             if group_name == "pp":
                 group._plait_pipeline = communicator
