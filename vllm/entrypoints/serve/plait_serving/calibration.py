@@ -210,7 +210,10 @@ class Calibrator:
             document = json.loads(run.output.read_text(encoding="utf-8"))
             if document["placement"] != ",".join(sorted(run.target.versions)):
                 raise ValueError("candidate benchmark returned another layout")
-            return document["slo_profile"]
+            profile = document["slo_profile"]
+            if profile is None:
+                raise ValueError("candidate benchmark did not meet its SLO at any rate")
+            return profile
         finally:
             self.cancel()
 
