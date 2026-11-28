@@ -8,6 +8,7 @@ import signal
 import tempfile
 import unittest
 from contextlib import nullcontext
+from dataclasses import replace
 from pathlib import Path
 from socket import AF_INET
 from types import SimpleNamespace
@@ -102,13 +103,23 @@ class TestPlaitDeployment(unittest.TestCase):
             assert command[command.index("--max-num-seqs") + 1] == "128"
 
     def test_pipeline_launch_binds_the_full_group_and_preserves_layer_order(self):
-        self.config.pipeline_layers = {"2": [11, 17]}
+        recipe = "05" * 16
+        self.config = replace(
+            self.config,
+            layout_recipes={
+                recipe: {
+                    "width": 2,
+                    "pipeline_layers": [11, 17],
+                    "kv_cache_memory_bytes_by_stage": [201326592, 335544320],
+                }
+            },
+        )
         grants = [
             {"device": {"node": [2] * 16, "ordinal": 1}},
             {"device": {"node": [1] * 16, "ordinal": 2}},
         ]
         placement = self.config.place(
-            {"version": self.placement.version, "grants": grants}
+            {"version": self.placement.version, "grants": grants, "recipe": [5] * 16}
         )
         engine = Engine(["vllm"], "/models/example", "CUDA_VISIBLE_DEVICES", [], {})
         with (
@@ -128,6 +139,11 @@ class TestPlaitDeployment(unittest.TestCase):
             command = spawn.call_args.args[0]
             assert command[command.index("--tensor-parallel-size") + 1] == "1"
             assert command[command.index("--pipeline-parallel-size") + 1] == "2"
+            budget_index = command.index("--kv-cache-memory-bytes-by-stage")
+            assert command[budget_index + 1 : budget_index + 3] == [
+                "201326592",
+                "335544320",
+            ]
             assert env["VLLM_PP_LAYER_PARTITION"] == "11,17"
             descriptor = json.loads(Path(env["VLLM_PLAIT_TP_GROUP_CONFIG"]).read_text())
             assert set(descriptor) == {"host_id", "seeds", "pp_groups"}
@@ -135,6 +151,30 @@ class TestPlaitDeployment(unittest.TestCase):
                 [self.first, 2],
                 [self.second, 1],
             ]
+
+    def test_recipe_rejects_invalid_stage_budgets(self):
+        for layers, budgets in [
+            ([], [1, 2]),
+            ([11, 17], [1]),
+            ([11, 17], [0, 2]),
+            ([11, 17], [True, 2]),
+        ]:
+            with (
+                self.subTest(layers=layers, budgets=budgets),
+                self.assertRaisesRegex(
+                    ValueError, "one positive KV budget per PP stage"
+                ),
+            ):
+                replace(
+                    self.config,
+                    layout_recipes={
+                        "05" * 16: {
+                            "width": 2,
+                            "pipeline_layers": layers,
+                            "kv_cache_memory_bytes_by_stage": budgets,
+                        }
+                    },
+                )
 
     def test_committed_recipe_disambiguates_layouts_with_the_same_width(self):
         tensor = "04" * 16

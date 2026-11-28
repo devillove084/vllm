@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Callable
+from copy import copy
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
 
 import torch
@@ -272,6 +273,19 @@ class WorkerWrapperBase:
         assert vllm_config is not None, (
             "vllm_config is required to initialize the worker"
         )
+        stage_budget = vllm_config.parallel_config.kv_cache_bytes_for_rank(
+            self.global_rank
+        )
+        if stage_budget is not None:
+            vllm_config = copy(vllm_config)
+            vllm_config.cache_config = copy(vllm_config.cache_config)
+            vllm_config.cache_config.kv_cache_memory_bytes = stage_budget
+            kwargs = {**kwargs, "vllm_config": vllm_config}
+            logger.info(
+                "Plait worker %d KV cache budget: %d bytes",
+                self.global_rank,
+                stage_budget,
+            )
         self.vllm_config = vllm_config
 
         vllm_config.enable_trace_function_call_for_thread()

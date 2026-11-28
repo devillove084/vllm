@@ -302,6 +302,12 @@ class ParallelConfig:
     Supply one positive count per node on every host. The counts must sum to
     tensor_parallel_size times pipeline_parallel_size.
     """
+    kv_cache_memory_bytes_by_stage: tuple[int, ...] | None = None
+    """Per-worker KV cache bytes in pipeline stage order for Plait PP.
+
+    All TP workers in a stage use the same budget. This takes precedence over
+    the scalar KV cache budget. Omit it to use the scalar or profiled budget.
+    """
     numa_bind: bool = False
     """Enable NUMA binding for GPU worker subprocesses.
 
@@ -805,6 +811,15 @@ class ParallelConfig:
             start = self.local_world_size * self.node_rank_within_dp
         return range(start, start + self.local_world_size)
 
+    def kv_cache_bytes_for_rank(self, rank: int) -> int | None:
+        budgets = self.kv_cache_memory_bytes_by_stage
+        if budgets is None:
+            return None
+        if not 0 <= rank < self.world_size:
+            raise ValueError("worker rank is outside the Plait pipeline")
+        # Plait PP without DP or PCP uses consecutive TP ranks in each stage.
+        return budgets[rank // self.tensor_parallel_size]
+
     @staticmethod
     def has_unfinished_dp(dp_group: ProcessGroup, has_unfinished: bool) -> bool:
         tensor = torch.tensor([has_unfinished], dtype=torch.int32, device="cpu")
@@ -884,6 +899,7 @@ class ParallelConfig:
             "node_rank",
             "nnodes",
             "plait_tp_layout",
+            "kv_cache_memory_bytes_by_stage",
             "max_parallel_loading_workers",
             "disable_custom_all_reduce",
             "ray_workers_use_nsight",
@@ -1098,6 +1114,22 @@ class ParallelConfig:
         from vllm.v1.executor import Executor
 
         layout = self.plait_tp_layout
+        budgets = self.kv_cache_memory_bytes_by_stage
+        if budgets is not None:
+            if (
+                not envs.VLLM_USE_PLAIT
+                or self.pipeline_parallel_size < 2
+                or self.data_parallel_size != 1
+                or self.prefill_context_parallel_size != 1
+            ):
+                raise ValueError(
+                    "--kv-cache-memory-bytes-by-stage requires Plait PP "
+                    "with DP and PCP sizes of 1"
+                )
+            if len(budgets) != self.pipeline_parallel_size or any(
+                amount <= 0 for amount in budgets
+            ):
+                raise ValueError("provide one positive KV cache budget per PP stage")
         if envs.VLLM_USE_PLAIT and self.pipeline_parallel_size > 1:
             if self.distributed_executor_backend != "mp":
                 raise ValueError("Plait pipeline parallelism requires the mp executor")

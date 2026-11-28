@@ -108,6 +108,10 @@ def agree_on_plait_layout(
             plan["checkpoint_admission"] = True
         if checkpoint_peer_budget:
             plan["checkpoint_peer_budget"] = True
+        if config.kv_cache_memory_bytes_by_stage is not None:
+            plan["kv_cache_memory_bytes_by_stage"] = (
+                config.kv_cache_memory_bytes_by_stage
+            )
         layout = json.dumps(plan).encode()
     store.set(key, layout)
     try:
@@ -121,7 +125,7 @@ def agree_on_plait_layout(
     if any(other != layout for other in observed):
         raise ValueError(
             "Inconsistent --plait-tp-layout, TP/PP sizes, layer partition "
-            "or KV capabilities: " + ", ".join(plan.decode() for plan in observed)
+            "or KV configuration: " + ", ".join(plan.decode() for plan in observed)
         )
     return launch_store
 

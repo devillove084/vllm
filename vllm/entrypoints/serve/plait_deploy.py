@@ -167,8 +167,15 @@ class Deployment:
             width = recipe.get("width")
             layers = recipe.get("pipeline_layers", [])
             egress = recipe.get("replicated_egress_bytes")
+            budgets = recipe.get("kv_cache_memory_bytes_by_stage")
             if (
-                set(recipe) - {"width", "pipeline_layers", "replicated_egress_bytes"}
+                set(recipe)
+                - {
+                    "width",
+                    "pipeline_layers",
+                    "replicated_egress_bytes",
+                    "kv_cache_memory_bytes_by_stage",
+                }
                 or type(width) is not int
                 or not 0 < width < 2**32
                 or not isinstance(layers, list)
@@ -187,6 +194,15 @@ class Deployment:
             ):
                 raise ValueError(
                     "layout recipe needs a valid width, layers and TP AllReduce budget"
+                )
+            if budgets is not None and (
+                not layers
+                or not isinstance(budgets, list)
+                or len(budgets) != len(layers)
+                or any(type(amount) is not int or amount <= 0 for amount in budgets)
+            ):
+                raise ValueError(
+                    "layout recipe needs one positive KV budget per PP stage"
                 )
         if len(self.recipe_bindings()) != len(self.layout_recipes or {}):
             raise ValueError("duplicate committed Plait recipe binding")
@@ -227,6 +243,7 @@ class Deployment:
         width = sum(len(ordinals) for ordinals in ordered.values())
         layers = (self.pipeline_layers or {}).get(str(width), ())
         egress = None
+        budgets = None
         if "recipe" not in view and self.layout_recipes:
             raise ValueError(
                 "layout recipes require a recipe-aware Plait control plane"
@@ -240,6 +257,7 @@ class Deployment:
                 )
             layers = recipe.get("pipeline_layers", ())
             egress = recipe.get("replicated_egress_bytes")
+            budgets = recipe.get("kv_cache_memory_bytes_by_stage")
         offset = (version["epoch"] - 1) % self.epoch_ports
         return Placement(
             version,
@@ -250,6 +268,7 @@ class Deployment:
             self.rendezvous_port_base + offset,
             tuple(layers),
             egress,
+            tuple(budgets) if budgets is not None else None,
         )
 
 
@@ -263,6 +282,7 @@ class Placement:
     rendezvous_port: int
     pipeline_layers: tuple[int, ...] = ()
     replicated_egress_bytes: int | None = None
+    kv_cache_memory_bytes_by_stage: tuple[int, ...] | None = None
 
     @property
     def origin(self) -> str:
@@ -635,6 +655,13 @@ class Engine:
             "--max-num-seqs",
             str(deployment.max_num_seqs),
         ]
+        if placement.kv_cache_memory_bytes_by_stage is not None:
+            command.extend(
+                (
+                    "--kv-cache-memory-bytes-by-stage",
+                    *map(str, placement.kv_cache_memory_bytes_by_stage),
+                )
+            )
         if len(nodes) > 1:
             command.extend(
                 (

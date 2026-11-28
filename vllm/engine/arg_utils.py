@@ -512,6 +512,9 @@ class EngineArgs:
     master_port: int = ParallelConfig.master_port
     nnodes: int = ParallelConfig.nnodes
     plait_tp_layout: tuple[int, ...] | None = ParallelConfig.plait_tp_layout
+    kv_cache_memory_bytes_by_stage: tuple[int, ...] | None = (
+        ParallelConfig.kv_cache_memory_bytes_by_stage
+    )
     node_rank: int = ParallelConfig.node_rank
     distributed_timeout_seconds: int | None = ParallelConfig.distributed_timeout_seconds
     cpu_distributed_timeout_seconds: int | None = (
@@ -1121,6 +1124,10 @@ class EngineArgs:
         parallel_group.add_argument("--node-rank", "-r", **parallel_kwargs["node_rank"])
         parallel_group.add_argument(
             "--plait-tp-layout", **parallel_kwargs["plait_tp_layout"]
+        )
+        parallel_group.add_argument(
+            "--kv-cache-memory-bytes-by-stage",
+            **parallel_kwargs["kv_cache_memory_bytes_by_stage"],
         )
         parallel_group.add_argument(
             "--distributed-timeout-seconds",
@@ -2477,6 +2484,7 @@ class EngineArgs:
             nnodes=self.nnodes,
             node_rank=self.node_rank,
             plait_tp_layout=self.plait_tp_layout,
+            kv_cache_memory_bytes_by_stage=self.kv_cache_memory_bytes_by_stage,
             distributed_timeout_seconds=self.distributed_timeout_seconds,
             cpu_distributed_timeout_seconds=self.cpu_distributed_timeout_seconds,
             data_parallel_master_ip=data_parallel_address,

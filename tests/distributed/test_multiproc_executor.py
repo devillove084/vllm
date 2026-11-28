@@ -69,8 +69,14 @@ def test_plait_layout_rejects_invalid_worker_counts(monkeypatch, layout):
 @pytest.mark.parametrize(
     "topologies",
     [
-        [(4, 1, (2, 1, 1)), (4, 1, (2, 1, 1)), (4, 1, (1, 1, 2))],
-        [(2, 2, (1, 3)), (1, 4, (1, 3))],
+        [
+            (4, 1, (2, 1, 1), None),
+            (4, 1, (2, 1, 1), None),
+            (4, 1, (1, 1, 2), None),
+        ],
+        [(2, 2, (1, 3), None), (1, 4, (1, 3), None)],
+        [(1, 2, (1, 1), (329, 183)), (1, 2, (1, 1), (256, 256))],
+        [(1, 2, (1, 1), (329, 183)), (1, 2, (1, 1), None)],
     ],
 )
 def test_plait_layout_rejects_conflicting_host_placements(monkeypatch, topologies):
@@ -87,14 +93,35 @@ def test_plait_layout_rejects_conflicting_host_placements(monkeypatch, topologie
             master_port=port,
             cpu_distributed_timeout_seconds=10,
             plait_tp_layout=layout,
+            kv_cache_memory_bytes_by_stage=budgets,
         )
-        for rank, (tp, pp, layout) in enumerate(topologies)
+        for rank, (tp, pp, layout, budgets) in enumerate(topologies)
     ]
     with ThreadPoolExecutor(max_workers=3) as pool:
         attempts = [pool.submit(agree_on_plait_layout, config) for config in configs]
         with pytest.raises(ValueError, match="Inconsistent --plait-tp-layout"):
             attempts[0].result()
         assert all(attempt.exception() is not None for attempt in attempts[1:])
+
+
+def test_plait_stage_cache_budget_is_shared_by_tp_workers(monkeypatch):
+    monkeypatch.setenv("VLLM_USE_PLAIT", "1")
+    config = ParallelConfig(
+        tensor_parallel_size=2,
+        pipeline_parallel_size=2,
+        distributed_executor_backend="mp",
+        nnodes=2,
+        plait_tp_layout=(1, 3),
+        kv_cache_memory_bytes_by_stage=(329, 183),
+    )
+    assert [config.kv_cache_bytes_for_rank(rank) for rank in range(4)] == [
+        329,
+        329,
+        183,
+        183,
+    ]
+    with pytest.raises(ValueError, match="outside the Plait pipeline"):
+        config.kv_cache_bytes_for_rank(4)
 
 
 def test_worker_ready_preserves_local_spawn_order():
