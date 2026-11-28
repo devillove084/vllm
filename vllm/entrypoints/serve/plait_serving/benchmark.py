@@ -28,15 +28,17 @@ def transferred_bytes(url: str | None) -> int | None:
     return int(sum(float(item) for item in TRANSFER_BYTES.findall(metrics)))
 
 
+def meets_attainment(trials: list[dict], attainment: float) -> bool:
+    return all(
+        trial["good_requests"] / trial["arrivals"] >= attainment for trial in trials
+    )
+
+
 def summarize(points: list[dict], attainment: float, valid_for_ms: int) -> dict:
     """Use the last contiguous rate that met the SLO in every repeated trial."""
     selected = None
     for point in points:
-        trials = point["trials"]
-        passed = all(
-            trial["good_requests"] / trial["arrivals"] >= attainment for trial in trials
-        )
-        point["passes"] = passed
+        point["passes"] = meets_attainment(point["trials"], attainment)
     for point in points:
         if not point["passes"]:
             break
@@ -177,6 +179,11 @@ def main() -> None:
     parser.add_argument("--tpot-ms", type=float, required=True)
     parser.add_argument("--attainment", type=float, default=0.95)
     parser.add_argument(
+        "--stop-at-first-miss",
+        action="store_true",
+        help="stop after the first rate whose trials fail the SLO attainment target",
+    )
+    parser.add_argument(
         "--valid-for", type=int, default=1800, help="profile lifetime in seconds"
     )
     parser.add_argument(
@@ -207,15 +214,14 @@ def main() -> None:
         prefix="plait-bench-", dir=args.output.parent
     ) as work:
         directory = Path(work)
-        points = [
-            {
-                "offered_rps": rate,
-                "trials": [
-                    run_trial(args, rate, seed, directory) for seed in args.seeds
-                ],
-            }
-            for rate in sorted(args.rates)
-        ]
+        points = []
+        for rate in sorted(args.rates):
+            trials = [run_trial(args, rate, seed, directory) for seed in args.seeds]
+            points.append({"offered_rps": rate, "trials": trials})
+            if args.stop_at_first_miss and not meets_attainment(
+                trials, args.attainment
+            ):
+                break
         result = {
             "placement": args.placement,
             "workload": {

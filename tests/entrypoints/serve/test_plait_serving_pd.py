@@ -489,6 +489,41 @@ class CalibrationTest(unittest.TestCase):
         self.assertEqual(result["transfer_profile"]["bytes_per_request"], 24)
         self.assertEqual([point["passes"] for point in points], [True, False, True])
 
+    def test_online_calibration_finishes_the_first_failing_rate_and_stops(self):
+        settings = Settings(
+            "/model", 16, 8, (4, 1, 2), (7, 23), 100, 20, attainment=0.9
+        )
+        endpoint = Endpoint("127.0.0.1", 8000, "01" * 16 + "@1", "aggregated")
+        target = Target(1, frozenset(), ((endpoint,),), 3)
+
+        def trial(args, rate, seed, directory):
+            return {
+                "seed": seed,
+                "good_requests": 8 if (rate, seed) == (2, 7) else 10,
+                "arrivals": 10,
+                "finished_at_ms": 1000,
+                "kv_bytes": None,
+                "benchmark": {"request_goodput": rate},
+            }
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "capacity.json"
+            command = settings.command("http://127.0.0.1:7000", "test", target, output)
+            with (
+                patch("sys.argv", command[2:]),
+                patch.object(benchmark, "run_trial", side_effect=trial) as run,
+            ):
+                benchmark.main()
+            self.assertEqual(
+                [call.args[1:3] for call in run.call_args_list],
+                [(1, 7), (1, 23), (2, 7), (2, 23)],
+            )
+            report = json.loads(output.read_text())
+            self.assertEqual(report["selected_rate"], 1)
+            self.assertEqual(
+                [point["passes"] for point in report["points"]], [True, False]
+            )
+
 
 def native_deployment(group: str, host: str, port: int) -> dict:
     return {

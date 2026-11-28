@@ -106,6 +106,7 @@ class Settings:
             command.extend([f"--{flag}", str(value)])
         return [
             *command,
+            "--stop-at-first-miss",
             "--rates",
             *map(str, self.rates),
             "--seeds",
