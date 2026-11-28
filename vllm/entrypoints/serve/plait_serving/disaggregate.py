@@ -194,6 +194,7 @@ class NativeDirectory(ControlDirectory):
     def __init__(self, model: str, control: Control, path: Path) -> None:
         super().__init__(model, control)
         self.path = path
+        self.changed = threading.Condition(self.lock)
         self.mode_view: ModeView | None = None
         self.configured: list[Destination] = []
         self.discovery: dict = {}
@@ -231,7 +232,7 @@ class NativeDirectory(ControlDirectory):
             (path.prefill, path.decode) if isinstance(path, Route) else (path,)
             for path in configured
         )
-        with self.lock:
+        with self.changed:
             self.revision = revision
             self.configured = paths
             self.discovery = discovery
@@ -246,6 +247,23 @@ class NativeDirectory(ControlDirectory):
             ]
             self.mode_view = ModeView(revision, bindings, tuple(groups), active)
             self.until = sent + DIRECTORY_READ_TTL
+            self.changed.notify_all()
+
+    def replacement_routes(
+        self, attempted: list[Destination], deadline: float
+    ) -> list[Destination]:
+        attempted_set = set(attempted)
+
+        def available() -> list[Destination]:
+            if time.monotonic() >= self.until:
+                return []
+            return [path for path in self.paths if path not in attempted_set]
+
+        # The directory watcher already observes ordered active sets for all
+        # requests. Wait through a poll without adding extra control requests.
+        budget = min(2 * DIRECTORY_POLL_SECONDS, deadline - time.monotonic())
+        with self.changed:
+            return self.changed.wait_for(available, timeout=max(0.0, budget)) or []
 
     def mode_snapshot(self) -> ModeView | None:
         with self.lock:
@@ -548,6 +566,18 @@ def server(
                 routes = routes[start:] + routes[:start]
             if replay is not None:
                 return self.route_replay(routes, replay, deadline)
+            completed = self.try_routes(routes, body, deadline)
+            if completed is None and isinstance(directory, NativeDirectory):
+                replacement = directory.replacement_routes(routes, deadline)
+                completed = self.try_routes(replacement, body, deadline)
+            if completed is None:
+                self.fail(503, "no serving route accepted the request")
+                return False
+            return completed
+
+        def try_routes(
+            self, routes: list[Destination], body: dict, deadline: float
+        ) -> bool | None:
             for route in routes:
                 budget = deadline - time.monotonic()
                 if budget <= 0:
@@ -565,8 +595,7 @@ def server(
                 except (OSError, http.client.HTTPException, UpstreamError) as error:
                     self.fail(502, str(error))
                     return False
-            self.fail(503, "no serving route accepted the request")
-            return False
+            return None
 
         def try_aggregated(
             self, endpoint: Endpoint, body: dict, deadline: float

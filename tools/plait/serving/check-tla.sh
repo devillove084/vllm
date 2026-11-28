@@ -16,6 +16,7 @@ check() {
 
 check PlaitServingIngress PlaitServingIngress
 check PlaitNativeServingIngress PlaitServingIngress
+check PlaitNativeBridgeHandoff PlaitNativeBridgeHandoff
 check PlaitCompletionReplay PlaitCompletionReplay
 check PlaitCompletionKvResume PlaitCompletionReplay
 check PlaitCompletionPrefixResume PlaitCompletionPrefixResume

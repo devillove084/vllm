@@ -1242,6 +1242,99 @@ class HandoffTest(unittest.TestCase):
             (200, SPARE, {"ok": True}),
         )
 
+    def native_switch_directory(self, old_port, new_port):
+        folder = self.runtime.enter_context(tempfile.TemporaryDirectory())
+        path = Path(folder) / "routes.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "model": "test",
+                    "revision": 1,
+                    "paths": [],
+                    "aggregated": [
+                        {"url": f"http://127.0.0.1:{port}", "version": version}
+                        for port, version in ((old_port, DECODE), (new_port, SPARE))
+                    ],
+                }
+            )
+        )
+        keys = [list(bytes.fromhex(v.split("@")[0])) for v in (DECODE, SPARE)]
+        control = Mock()
+        directory = disaggregate.NativeDirectory("test", control, path)
+
+        def publish(epochs):
+            control.request.return_value = {
+                "result": {"Ok": {"ActiveSet": list(zip(keys, epochs, strict=True))}}
+            }
+            directory.refresh()
+
+        publish([1, None])
+        return directory, publish
+
+    def test_native_ingress_waits_for_a_replacement_after_closed_admission(self):
+        old_port, old_gate = self.group(
+            "aggregated", DECODE, lambda _: self.fail("closed group ran")
+        )
+        respond = Mock(return_value=("application/json", b'{"ok":true}'))
+        new_port, _ = self.group("aggregated", SPARE, respond)
+        directory, publish = self.native_switch_directory(old_port, new_port)
+        rejected = threading.Event()
+        probe = disaggregate.endpoint_ready
+        check_rejection = disaggregate.admission_rejected
+
+        def ready(endpoint, timeout):
+            status = probe(endpoint, timeout)
+            if endpoint.version == DECODE:
+                old_gate.close()
+            return status
+
+        def saw_rejection(response):
+            status = check_rejection(response)
+            if status:
+                rejected.set()
+            return status
+
+        ingress = self.start(disaggregate.server("127.0.0.1", 0, directory, 2))
+        with (
+            patch.object(disaggregate, "endpoint_ready", side_effect=ready),
+            patch.object(disaggregate, "admission_rejected", side_effect=saw_rejection),
+            ThreadPoolExecutor(max_workers=1) as executor,
+        ):
+            request = executor.submit(
+                self.request, ingress, COMPLETIONS, {"model": "test"}
+            )
+            self.assertTrue(rejected.wait(2))
+            publish([None, 1])
+            status, _, body = request.result(timeout=2)
+        self.assertEqual((status, json.loads(body)), (200, {"ok": True}))
+        respond.assert_called_once()
+
+    def test_native_ingress_never_retries_a_post_with_unknown_outcome(self):
+        respond = Mock()
+        new_port, _ = self.group("aggregated", SPARE, respond)
+        received = threading.Event()
+
+        class Dropped(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                headers = Endpoint("127.0.0.1", 1, DECODE, "aggregated").headers()
+                for key, value in headers.items():
+                    self.send_header(key, value)
+                self.end_headers()
+
+            def do_POST(self):
+                self.rfile.read(int(self.headers["Content-Length"]))
+                received.set()
+                publish([None, 1])
+
+        old_port = self.start(ThreadingHTTPServer(("127.0.0.1", 0), Dropped))
+        directory, publish = self.native_switch_directory(old_port, new_port)
+        ingress = self.start(disaggregate.server("127.0.0.1", 0, directory, 2))
+        status, _, _ = self.request(ingress, COMPLETIONS, {"model": "test"})
+        self.assertEqual(status, 502)
+        self.assertTrue(received.is_set())
+        respond.assert_not_called()
+
     def test_aggregate_ingress_does_not_replay_after_the_upstream_receives_bytes(self):
         received = threading.Event()
         new_port, _ = self.group(
