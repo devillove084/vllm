@@ -1,9 +1,9 @@
 ---- MODULE PlaitShardedPromptOverlap ----
 EXTENDS Naturals, Sequences, FiniteSets
 
-CONSTANT KeepBlockOrder
+CONSTANTS KeepBlockOrder, SlotCount
 
-Slots == 1..2
+Slots == 1..SlotCount
 Blocks == 1..3
 Call(block, kind) == [block |-> block, kind |-> kind]
 \* The packet determines each block's branch. Exercise partial, empty,
@@ -74,4 +74,7 @@ CollectiveOrder == \A slot \in Slots :
     outstanding[slot] # Idle => outstanding[slot].seq = consumed[slot] + 1
 
 ProjectionBound == \A slot \in Slots : Cardinality(prepared[slot]) <= 2
+
+RequestCanAdvance ==
+    (\A slot \in Slots : consumed[slot] = EndOfWire) \/ ENABLED Next
 ====
