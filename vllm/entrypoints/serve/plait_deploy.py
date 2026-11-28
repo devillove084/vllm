@@ -281,8 +281,115 @@ class Placement:
 
 @dataclass
 class FailedEngineLaunch:
-    error: str
+    path: Path
+    record: dict
     lock: IO[str]
+
+    @classmethod
+    def persist(
+        cls, path: Path, host: str, view: dict, error: OSError, lock: IO[str]
+    ) -> "FailedEngineLaunch":
+        grants = local_grants(view, host)
+        if not grants:
+            raise ValueError("failed launch has no local Plait grants")
+        record = {
+            "host": host,
+            "version": view["version"],
+            "grants": grants,
+            "origin": uuid.uuid4().hex,
+            "error": str(error),
+        }
+        write_json(path, record)
+        return cls(path, record, os.fdopen(os.dup(lock.fileno()), "a"))
+
+    @classmethod
+    def recover(
+        cls, path: Path, group_id: str, host: str
+    ) -> "FailedEngineLaunch | None":
+        lock_path = path.with_name(path.name.removesuffix(".failed.json") + ".lock")
+        lock = lock_path.open("a")
+        with ExitStack() as stack:
+            stack.callback(lock.close)
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                record = json.loads(path.read_text(encoding="utf-8"))
+            except (BlockingIOError, FileNotFoundError):
+                return None
+            try:
+                version = record["version"]
+                epoch = version["epoch"]
+                parse_id(record["origin"])
+                if (
+                    record["host"] != host
+                    or version["group"] != list(parse_id(group_id))
+                    or type(epoch) is not int
+                    or epoch <= 0
+                    or path.name != f"{group_id}@{epoch}.failed.json"
+                    or not isinstance(record["grants"], list)
+                    or not record["grants"]
+                ):
+                    raise ValueError("mismatched journal identity or grants")
+            except (KeyError, TypeError, ValueError) as error:
+                raise ValueError(
+                    f"invalid failed launch journal {path.name}"
+                ) from error
+            stack.pop_all()
+        return cls(path, record, lock)
+
+    def reconcile(self, control: Control) -> bool:
+        version = self.record["version"]
+        view = control.observe(version)
+        if view is None:
+            return False
+        grants = self.record["grants"]
+        if (
+            view["version"] != version
+            or local_grants(view, self.record["host"]) != grants
+        ):
+            raise ValueError(f"failed launch grants changed for {self.path.name}")
+        origin = list(parse_id(self.record["origin"]))
+        if view["phase"] == "Preparing":
+            apply_operation(
+                control,
+                {
+                    "id": {"origin": origin, "counter": 1},
+                    "action": {
+                        "ReportFailure": {"grant": grants[0], "fault": "Device"}
+                    },
+                },
+            )
+            return False
+        if view["phase"] not in ("Revoked", "Retired"):
+            raise ValueError(f"failed launch advanced to {view['phase']}")
+        # Use the original IDs even when a release committed before a crash.
+        for counter, grant in enumerate(grants, start=2):
+            apply_operation(
+                control,
+                {
+                    "id": {"origin": origin, "counter": counter},
+                    "action": {"Release": grant},
+                },
+            )
+        self.path.unlink(missing_ok=True)
+        sync_directory(self.path.parent)
+        self.lock.close()
+        version_name = self.path.name.removesuffix(".failed.json")
+        print(
+            f"Released local Plait grants for {version_name}",
+            flush=True,
+        )
+        return True
+
+
+def local_grants(view: dict, host: str) -> list[dict]:
+    return sorted(
+        (
+            grant
+            for grant in view["grants"]
+            if bytes(grant["device"]["node"]).hex() == host
+        ),
+        key=lambda grant: grant["device"]["ordinal"],
+    )
 
 
 @dataclass
@@ -428,6 +535,9 @@ class Engine:
         # A surviving engine owns its launch lock across supervisor restarts.
         with descriptor.with_suffix(".lock").open("a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            failed = descriptor.with_suffix(".failed.json")
+            if failed.exists():
+                return None
             view = control.observe(placement.version)
             if view is None or view["phase"] != "Preparing":
                 return None
@@ -452,9 +562,7 @@ class Engine:
                     errno.ENOEXEC,
                 ):
                     raise
-                return FailedEngineLaunch(
-                    str(error), os.fdopen(os.dup(lock.fileno()), "a")
-                )
+                return FailedEngineLaunch.persist(failed, host, view, error, lock)
 
 
 def versioned_status(
@@ -478,6 +586,30 @@ def healthy(placement: Placement) -> bool:
     return versioned_status(placement, "/health", 200)
 
 
+def sync_directory(path: Path) -> None:
+    directory = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
+def write_json(path: Path, document: dict) -> None:
+    with tempfile.NamedTemporaryFile(
+        "w", encoding="utf-8", dir=path.parent, delete=False
+    ) as file:
+        pending = Path(file.name)
+        try:
+            json.dump(document, file)
+            file.flush()
+            os.fsync(file.fileno())
+            file.close()
+            pending.replace(path)
+            sync_directory(path.parent)
+        finally:
+            pending.unlink(missing_ok=True)
+
+
 def publish(path: Path, placement: Placement) -> None:
     try:
         routes = json.loads(path.read_text(encoding="utf-8"))
@@ -489,23 +621,13 @@ def publish(path: Path, placement: Placement) -> None:
             raise ValueError(f"epoch {epoch} already has a different HTTP origin")
         return
     routes[epoch] = placement.origin
-    with tempfile.NamedTemporaryFile(
-        "w", encoding="utf-8", dir=path.parent, delete=False
-    ) as file:
-        pending = Path(file.name)
-        try:
-            json.dump(routes, file)
-            file.flush()
-            os.fsync(file.fileno())
-            file.close()
-            pending.replace(path)
-            directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
-            try:
-                os.fsync(directory)
-            finally:
-                os.close(directory)
-        finally:
-            pending.unlink(missing_ok=True)
+    write_json(path, routes)
+
+
+def apply_operation(control: Control, operation: dict) -> None:
+    result = control.request("apply", operation=operation)["result"]
+    if "Ok" not in result:
+        raise ControlUnavailable(f"Plait group operation rejected: {result['Err']}")
 
 
 class RoutePublisher:
@@ -540,7 +662,7 @@ class RoutePublisher:
 
 @dataclass
 class WorkerProcess:
-    process: subprocess.Popen[bytes] | FailedEngineLaunch
+    process: subprocess.Popen[bytes]
     placement: Placement
     grants: list[dict]
     drain_marker: Path | None
@@ -559,7 +681,7 @@ class WorkerProcess:
             raise ControlUnavailable(f"Plait group operation rejected: {result['Err']}")
 
     def gone(self) -> bool:
-        if self.group_exited or isinstance(self.process, FailedEngineLaunch):
+        if self.group_exited:
             return True
         if self.process.poll() is None:
             return False
@@ -583,10 +705,7 @@ class WorkerProcess:
             if phase in ("Draining", "Revoked", "Retired"):
                 view = control.observe(version)
                 phase = view["phase"] if view else None
-            if phase not in ("Revoked", "Retired") and (
-                isinstance(self.process, FailedEngineLaunch)
-                or self.process.poll() is not None
-            ):
+            if phase not in ("Revoked", "Retired") and self.process.poll() is not None:
                 self.apply(
                     control,
                     {"ReportFailure": {"grant": self.grants[0], "fault": "Device"}},
@@ -606,16 +725,12 @@ class WorkerProcess:
         while self.release_index < len(self.grants):
             self.apply(control, {"Release": self.grants[self.release_index]})
             self.release_index += 1
-        if isinstance(self.process, FailedEngineLaunch):
-            self.process.lock.close()
         print(
             f"Released local Plait grants for {self.placement.version_text}", flush=True
         )
         return True
 
     def signal(self, sig: signal.Signals) -> None:
-        if isinstance(self.process, FailedEngineLaunch):
-            return
         with suppress(ProcessLookupError):
             os.killpg(self.process.pid, sig)
 
@@ -641,12 +756,36 @@ def supervise(
 ) -> None:
     group = list(parse_id(deployment.group_id))
     children: dict[int, WorkerProcess] = {}
+    failures: dict[Path, FailedEngineLaunch] = {}
     last_error = None
     if engine is not None:
         reap_orphaned_workers()
     try:
         local_errors: dict[int, str] = {}
+        failure_errors: dict[Path, str] = {}
         while True:
+            if engine is not None and state is not None and host is not None:
+                journals = set(state.glob(f"{deployment.group_id}@*.failed.json"))
+                for journal in sorted(journals.union(failures)):
+                    try:
+                        failure = failures.get(journal)
+                        if failure is None:
+                            failure = FailedEngineLaunch.recover(
+                                journal, deployment.group_id, host
+                            )
+                            if failure is None:
+                                continue
+                            failures[journal] = failure
+                        if failure.reconcile(control):
+                            del failures[journal]
+                        failure_errors.pop(journal, None)
+                    except (ControlUnavailable, OSError, ValueError) as error:
+                        if failure_errors.get(journal) != str(error):
+                            failure_errors[journal] = str(error)
+                            print(
+                                f"Plait deployment for {journal.name}: {error}",
+                                flush=True,
+                            )
             for epoch, child in list(children.items()):
                 try:
                     if child.reconcile(control):
@@ -688,11 +827,7 @@ def supervise(
                                 and host is not None
                                 and host in placement.devices
                             ):
-                                grants = [
-                                    grant
-                                    for grant in view["grants"]
-                                    if bytes(grant["device"]["node"]).hex() == host
-                                ]
+                                grants = local_grants(view, host)
                                 drain_marker = None
                                 if host == next(iter(placement.devices)):
                                     drain_marker = (
@@ -701,7 +836,15 @@ def supervise(
                                 process = engine.start(
                                     deployment, placement, host, state, control
                                 )
-                                if process is not None:
+                                if isinstance(process, FailedEngineLaunch):
+                                    failures[process.path] = process
+                                    print(
+                                        f"Plait engine for epoch {epoch} "
+                                        "failed to start: "
+                                        f"{process.record['error']}",
+                                        flush=True,
+                                    )
+                                elif process is not None:
                                     children[epoch] = WorkerProcess(
                                         process,
                                         placement,
@@ -709,12 +852,6 @@ def supervise(
                                         drain_marker,
                                         api_role=engine.api_role,
                                     )
-                                    if isinstance(process, FailedEngineLaunch):
-                                        print(
-                                            f"Plait engine for epoch {epoch} "
-                                            f"failed to start: {process.error}",
-                                            flush=True,
-                                        )
                             if route and router is not None:
                                 router.reconcile(control, placement, phase)
                 last_error = None
@@ -725,13 +862,12 @@ def supervise(
                     last_error = message
             time.sleep(0.5)
     finally:
+        for failure in failures.values():
+            failure.lock.close()
         for child in children.values():
             if not child.gone():
                 child.signal(signal.SIGTERM)
         for child in children.values():
-            if isinstance(child.process, FailedEngineLaunch):
-                child.process.lock.close()
-                continue
             try:
                 child.process.wait(timeout=10)
             except subprocess.TimeoutExpired:

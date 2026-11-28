@@ -273,7 +273,7 @@ class TestPlaitDeployment(unittest.TestCase):
                 assert response.status_code == 200
                 assert response.headers["X-Plait-Group-Role"] == "prefill"
 
-    def test_missing_executable_keeps_claim_until_revoked_grant_is_released(self):
+    def test_failed_launch_replays_report_and_release_across_restarts(self):
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory)
             engine = Engine(
@@ -283,19 +283,18 @@ class TestPlaitDeployment(unittest.TestCase):
                 [],
                 {},
             )
-            lock_path = state / f"{self.placement.version_text}.lock"
-            launch = engine.start(
-                self.config, self.placement, self.first, state, self.control
-            )
-            assert isinstance(launch, FailedEngineLaunch)
-            grant = {"device": {"node": [1] * 16, "ordinal": 2}, "fence": 7}
-            worker = WorkerProcess(launch, self.placement, [grant], None)
+            prefix = self.placement.version_text
+            journal = state / f"{prefix}.failed.json"
             phase = "Preparing"
+            grant = {"device": {"node": [1] * 16, "ordinal": 2}, "fence": 7}
+            self.control.observe.side_effect = lambda version: {
+                "version": version,
+                "phase": phase,
+                "grants": [grant],
+            }
             operations = []
 
             def request(name, **fields):
-                if name == "view":
-                    return {"group": {"phase": phase}}
                 assert name == "apply"
                 operations.append(fields["operation"])
                 if len(operations) in (1, 3):
@@ -303,24 +302,94 @@ class TestPlaitDeployment(unittest.TestCase):
                 return {"result": {"Ok": {}}}
 
             self.control.request.side_effect = request
-            self.control.observe.side_effect = lambda version: {"phase": phase}
-            with lock_path.open("a") as probe:
-                with self.assertRaises(ControlUnavailable):
-                    worker.reconcile(self.control)
-                assert not worker.reconcile(self.control)
+            launch = engine.start(
+                self.config, self.placement, self.first, state, self.control
+            )
+            assert isinstance(launch, FailedEngineLaunch)
+            assert journal.is_file()
+            self.addCleanup(launch.lock.close)
+            with self.assertRaises(ControlUnavailable):
+                launch.reconcile(self.control)
+            with (state / f"{prefix}.lock").open("a") as probe:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                launch.lock.close()
+                recovered = FailedEngineLaunch.recover(
+                    journal, self.config.group_id, self.first
+                )
+                assert recovered is not None
+                self.addCleanup(recovered.lock.close)
+                assert not recovered.reconcile(self.control)
                 assert operations[0] == operations[1]
                 assert operations[0]["action"] == {
                     "ReportFailure": {"grant": grant, "fault": "Device"}
                 }
+
                 phase = "Revoked"
                 with self.assertRaises(ControlUnavailable):
-                    worker.reconcile(self.control)
+                    recovered.reconcile(self.control)
                 with self.assertRaises(BlockingIOError):
                     fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                assert worker.reconcile(self.control)
-                assert operations[-2] == operations[-1]
-                assert operations[-1]["action"] == {"Release": grant}
+                recovered.lock.close()
+
+                phase = "Retired"
+                resumed = FailedEngineLaunch.recover(
+                    journal, self.config.group_id, self.first
+                )
+                assert resumed is not None
+                self.addCleanup(resumed.lock.close)
+                assert resumed.reconcile(self.control)
+                assert operations[2] == operations[3]
+                assert operations[2]["action"] == {"Release": grant}
+                assert not journal.exists()
                 fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def test_failed_launch_journal_blocks_spawn_and_rejects_changed_grants(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            engine = Engine(
+                [str(state / "missing")],
+                "/models/example",
+                "CUDA_VISIBLE_DEVICES",
+                [],
+                {},
+            )
+            version = self.placement.version
+            original = {"device": {"node": [1] * 16, "ordinal": 2}, "fence": 7}
+            self.control.observe.return_value = {
+                "version": version,
+                "phase": "Preparing",
+                "grants": [original],
+            }
+            launch = engine.start(
+                self.config, self.placement, self.first, state, self.control
+            )
+            assert isinstance(launch, FailedEngineLaunch)
+            launch.lock.close()
+
+            with patch("vllm.entrypoints.serve.plait_deploy.subprocess.Popen") as spawn:
+                assert (
+                    engine.start(
+                        self.config, self.placement, self.first, state, self.control
+                    )
+                    is None
+                )
+                spawn.assert_not_called()
+
+            resumed = FailedEngineLaunch.recover(
+                launch.path, self.config.group_id, self.first
+            )
+            assert resumed is not None
+            with resumed.lock:
+                self.control.observe.return_value = {
+                    "version": version,
+                    "phase": "Revoked",
+                    "grants": [dict(original, fence=8)],
+                }
+                with self.assertRaisesRegex(ValueError, "grants changed"):
+                    resumed.reconcile(self.control)
+                assert launch.path.is_file()
+                self.control.request.assert_not_called()
 
     def test_engine_rechecks_phase_after_acquiring_launch_lock(self):
         engine = Engine(["vllm"], "/models/example", "CUDA_VISIBLE_DEVICES", [], {})
