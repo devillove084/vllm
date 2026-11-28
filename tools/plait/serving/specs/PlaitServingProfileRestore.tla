@@ -11,7 +11,7 @@ Prefill == 1
 Decode == 2
 Roles == {Prefill, Decode}
 Writers == {1, 2}
-Changes == {"Model", "Route", "Configuration", "Epoch", "Origin", "Manifest"}
+Changes == {"Model", "Route", "Configuration", "Warmups", "Epoch", "Origin", "Manifest"}
 Context(model, route, settings) == [model |-> model, route |-> route, settings |-> settings]
 Identity(change) ==
     LET epoch == IF change = "Epoch" THEN 2 ELSE 1
@@ -182,4 +182,7 @@ UseRechecksCurrentEvidence ==
 MeasuredActiveBaselineIsAvailable ==
     reader.cached # NoProfile /\ view.active = Roles /\ CurrentEvidence(reader.cached) =>
         ENABLED (UseProfile /\ reader'.used = "Active")
+
+WarmupCountDoesNotRekey ==
+    view.change = "Warmups" => Current = Identity("None")
 ====

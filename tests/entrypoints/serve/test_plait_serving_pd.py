@@ -1221,7 +1221,14 @@ class ModePolicyTest(unittest.TestCase):
         calibrator.run = SimpleNamespace(target=target)
         calibrator.poll.side_effect = lambda settings: self.target["slo_profile"]
         self.sample(12)
-        self.assertEqual(store.read()[0]["manifest"], target.manifest)
+        [profile] = store.read()
+        self.assertEqual(profile["manifest"], target.manifest)
+        policy = mode.Policy.read(self.policy, "test")
+        legacy_profile = {
+            **profile,
+            "context": self.controller.state_context(policy, legacy=True),
+        }
+        store.path.write_text(json.dumps({"format": 1, "profiles": [legacy_profile]}))
         self.active = target.versions
         self.ready = {self.versions[-1]}
         self.config["modes"] = []
@@ -1231,6 +1238,25 @@ class ModePolicyTest(unittest.TestCase):
         )
         self.sample(0, seconds=0)
         self.assertIn(target.versions, self.controller.measured)
+        self.assertIn(profile, store.read())
+
+        pending = self.controller.calibrator = Mock(run=None)
+        self.config["calibration"]["warmups"] = 8
+        self.policy.write_text(json.dumps(self.config))
+        self.sample(0, seconds=0)
+        pending.cancel.assert_called_once()
+        self.assertIn(target.versions, self.controller.measured)
+        self.controller = mode.ModeController(
+            self.policy, self.load, self.control, "test", profile_store=store
+        )
+        self.sample(0, seconds=0)
+        self.assertIn(target.versions, self.controller.measured)
+
+        self.config["calibration"]["ttft_ms"] += 1
+        self.policy.write_text(json.dumps(self.config))
+        self.sample(0, seconds=0)
+        self.assertNotIn(target.versions, self.controller.measured)
+        self.config["calibration"]["ttft_ms"] -= 1
         self.config["modes"].append(self.profile([self.versions[-1]], 1, 4))
         self.policy.write_text(json.dumps(self.config))
         self.sample(1)

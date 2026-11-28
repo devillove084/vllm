@@ -345,8 +345,7 @@ class ModeController:
         if policy != self.last_policy:
             if (
                 self.last_policy is None
-                or policy.route_revision != self.last_policy.route_revision
-                or policy.calibration != self.last_policy.calibration
+                or self.state_context(policy) != self.state_context(self.last_policy)
             ):
                 self.measured.clear()
                 self.restore_pending = self.load_profiles(policy)
@@ -356,7 +355,7 @@ class ModeController:
             self.reset_evidence()
         if view.revision == policy.route_revision:
             self.reap_failed_sets(policy)
-            self.restore_profiles(view)
+            self.restore_profiles(view, policy)
         self.finish_calibration(view, policy, snapshot)
         demand = self.sample(policy.window_seconds)
         if (
@@ -619,32 +618,40 @@ class ModeController:
                 raise ControlError("Plait returned a different aborted candidate set")
             print("Plait revoked an incomplete candidate set", flush=True)
 
-    def state_context(self, policy: Policy) -> str:
+    def state_context(self, policy: Policy, *, legacy: bool = False) -> str:
+        settings = (
+            asdict(policy.calibration) if policy.calibration is not None else None
+        )
+        if settings is not None and not legacy:
+            # A completed trial measures the timed workload of an exact live
+            # layout. Warmup count controls how subsequent trials prepare it.
+            del settings["warmups"]
         return fingerprint(
             {
                 "model": self.model,
                 "revision": policy.route_revision,
-                "settings": asdict(policy.calibration)
-                if policy.calibration is not None
-                else None,
+                "settings": settings,
             }
         )
 
     def load_profiles(self, policy: Policy) -> list[dict]:
         if self.profile_store is None or policy.calibration is None:
             return []
-        context = self.state_context(policy)
+        contexts = {self.state_context(policy), self.state_context(policy, legacy=True)}
         try:
             return [
                 record
                 for record in self.profile_store.read()
-                if record["context"] == context
+                if record["context"] in contexts
             ]
         except (OSError, ValueError, KeyError, TypeError) as error:
             print(f"Plait could not restore calibration profiles: {error}", flush=True)
             return []
 
-    def restore_profiles(self, view: ModeView) -> None:
+    def restore_profiles(self, view: ModeView, policy: Policy) -> None:
+        if not self.restore_pending:
+            return
+        context = self.state_context(policy)
         waiting = []
         now_ms = time.time_ns() // 1_000_000
         for record in self.restore_pending:
@@ -670,10 +677,27 @@ class ModeController:
             if layout is None:
                 waiting.append(record)
             elif layout == (capacity.devices, manifest) and manifest is not None:
+                if self.profile_store is not None and record["context"] != context:
+                    try:
+                        capacity = Capacity.read(
+                            self.profile_store.save(
+                                {**record, "context": context}, now_ms
+                            )
+                        )
+                    except (OSError, KeyError, TypeError, ValueError) as error:
+                        print(
+                            f"Plait could not migrate a capacity profile: {error}",
+                            flush=True,
+                        )
                 target = Target(
                     view.revision, view.active, routes, capacity.devices, manifest
                 )
-                self.measured[capacity.versions] = (target, capacity)
+                current = self.measured.get(capacity.versions)
+                if (
+                    current is None
+                    or capacity.valid_until_ms > current[1].valid_until_ms
+                ):
+                    self.measured[capacity.versions] = (target, capacity)
         self.restore_pending = waiting
 
     def calibrate(
