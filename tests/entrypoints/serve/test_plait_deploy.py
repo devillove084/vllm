@@ -4,6 +4,7 @@
 import asyncio
 import fcntl
 import json
+import signal
 import tempfile
 import unittest
 from pathlib import Path
@@ -22,7 +23,7 @@ from vllm.entrypoints.serve.plait_deploy import (
     ControlUnavailable,
     Deployment,
     Engine,
-    FailedEngineLaunch,
+    EngineGrantReturn,
     RoutePublisher,
     WorkerProcess,
 )
@@ -45,18 +46,18 @@ class TestPlaitDeployment(unittest.TestCase):
             rendezvous_port_base=8200,
             epoch_ports=16,
         )
-        self.placement = self.config.place(
-            {
-                "version": {"group": [3] * 16, "epoch": 2},
-                "grants": [
-                    {"device": {"node": [2] * 16, "ordinal": 5}},
-                    {"device": {"node": [1] * 16, "ordinal": 2}},
-                    {"device": {"node": [2] * 16, "ordinal": 1}},
-                ],
-            }
-        )
+        self.view = {
+            "version": {"group": [3] * 16, "epoch": 2},
+            "grants": [
+                {"device": {"node": [2] * 16, "ordinal": 5}},
+                {"device": {"node": [1] * 16, "ordinal": 2}},
+                {"device": {"node": [2] * 16, "ordinal": 1}},
+            ],
+            "phase": "Preparing",
+        }
+        self.placement = self.config.place(self.view)
         self.control = Mock(spec=Control)
-        self.control.observe.return_value = {"phase": "Preparing"}
+        self.control.observe.return_value = self.view
 
     def test_uneven_hosts_agree_on_engine_slot_order(self):
         group = self.placement.descriptor(self.second, self.config.seeds)["tp_groups"][
@@ -79,9 +80,11 @@ class TestPlaitDeployment(unittest.TestCase):
             patch(f"{module}.psutil.net_if_addrs", return_value=addresses),
             patch(f"{module}.subprocess.Popen") as spawn,
         ):
-            engine.start(
+            worker = engine.start(
                 self.config, self.placement, self.second, Path(directory), self.control
             )
+            assert isinstance(worker, WorkerProcess)
+            self.addCleanup(worker.lock.close)
             env = spawn.call_args.kwargs["env"]
             assert env["CUDA_VISIBLE_DEVICES"] == "1,5"
             assert env["GLOO_SOCKET_IFNAME"] == "data"
@@ -108,9 +111,11 @@ class TestPlaitDeployment(unittest.TestCase):
             ),
             patch("vllm.entrypoints.serve.plait_deploy.subprocess.Popen") as spawn,
         ):
-            engine.start(
+            worker = engine.start(
                 self.config, placement, self.first, Path(directory), self.control
             )
+            assert isinstance(worker, WorkerProcess)
+            self.addCleanup(worker.lock.close)
             env = spawn.call_args.kwargs["env"]
             command = spawn.call_args.args[0]
             assert command[command.index("--tensor-parallel-size") + 1] == "1"
@@ -305,7 +310,7 @@ class TestPlaitDeployment(unittest.TestCase):
             launch = engine.start(
                 self.config, self.placement, self.first, state, self.control
             )
-            assert isinstance(launch, FailedEngineLaunch)
+            assert isinstance(launch, EngineGrantReturn)
             assert journal.is_file()
             self.addCleanup(launch.lock.close)
             with self.assertRaises(ControlUnavailable):
@@ -314,7 +319,7 @@ class TestPlaitDeployment(unittest.TestCase):
                 with self.assertRaises(BlockingIOError):
                     fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 launch.lock.close()
-                recovered = FailedEngineLaunch.recover(
+                recovered = EngineGrantReturn.recover(
                     journal, self.config.group_id, self.first
                 )
                 assert recovered is not None
@@ -333,7 +338,7 @@ class TestPlaitDeployment(unittest.TestCase):
                 recovered.lock.close()
 
                 phase = "Retired"
-                resumed = FailedEngineLaunch.recover(
+                resumed = EngineGrantReturn.recover(
                     journal, self.config.group_id, self.first
                 )
                 assert resumed is not None
@@ -364,7 +369,7 @@ class TestPlaitDeployment(unittest.TestCase):
             launch = engine.start(
                 self.config, self.placement, self.first, state, self.control
             )
-            assert isinstance(launch, FailedEngineLaunch)
+            assert isinstance(launch, EngineGrantReturn)
             launch.lock.close()
 
             with patch("vllm.entrypoints.serve.plait_deploy.subprocess.Popen") as spawn:
@@ -376,7 +381,7 @@ class TestPlaitDeployment(unittest.TestCase):
                 )
                 spawn.assert_not_called()
 
-            resumed = FailedEngineLaunch.recover(
+            resumed = EngineGrantReturn.recover(
                 launch.path, self.config.group_id, self.first
             )
             assert resumed is not None
@@ -417,7 +422,21 @@ class TestPlaitDeployment(unittest.TestCase):
             process = Mock()
             process.poll.return_value = None
             grant = {"device": {"node": [1] * 16, "ordinal": 2}, "fence": 7}
-            worker = WorkerProcess(process, self.placement, [grant], marker)
+            state = Path(directory)
+            prefix = self.placement.version_text
+            stop_record = state / f"{prefix}.stopped.json"
+            launch_lock = (state / f"{prefix}.lock").open("a")
+            self.addCleanup(launch_lock.close)
+            fcntl.flock(launch_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            worker = WorkerProcess(
+                process,
+                self.placement,
+                [grant],
+                marker,
+                self.first,
+                stop_record,
+                launch_lock,
+            )
             control = Mock(spec=Control)
             phase = "Draining"
             submitted = []
@@ -435,12 +454,17 @@ class TestPlaitDeployment(unittest.TestCase):
                 return {"result": {"Ok": {}}}
 
             control.request.side_effect = request
-            control.observe.side_effect = lambda version: {"phase": phase}
+            control.observe.side_effect = lambda version: {
+                "version": version,
+                "phase": phase,
+                "grants": [grant],
+            }
             module = "vllm.entrypoints.serve.plait_deploy"
             with (
                 patch(f"{module}.versioned_status") as status,
                 patch.object(worker, "signal") as stop,
                 patch.object(worker, "gone", return_value=False) as gone,
+                patch(f"{module}.time.monotonic", return_value=10) as clock,
             ):
                 status.return_value = False
                 assert not worker.reconcile(control)
@@ -453,12 +477,37 @@ class TestPlaitDeployment(unittest.TestCase):
                 stop.assert_not_called()
                 phase = "Revoked"
                 assert not worker.reconcile(control)
-                stop.assert_called_once()
+                stop.assert_called_once_with(signal.SIGTERM)
                 assert len(submitted) == 1
+                assert not stop_record.exists()
+                assert worker.kill_after == 20
+                clock.return_value = 19
+                assert not worker.reconcile(control)
+                stop.assert_called_once()
+                clock.return_value = 20
+                assert not worker.reconcile(control)
+                stop.assert_called_with(signal.SIGKILL)
+                assert stop.call_count == 2
+                assert len(submitted) == 1
+                assert not stop_record.exists()
                 gone.return_value = True
                 with self.assertRaises(ControlUnavailable):
                     worker.reconcile(control)
-                assert worker.reconcile(control)
+                assert stop_record.exists()
+                assert (
+                    EngineGrantReturn.recover(
+                        stop_record, self.config.group_id, self.first
+                    )
+                    is None
+                )
+                worker.lock.close()
+                recovered = EngineGrantReturn.recover(
+                    stop_record, self.config.group_id, self.first
+                )
+                assert recovered is not None
+                with recovered.lock:
+                    assert recovered.reconcile(control)
+                assert not stop_record.exists()
                 assert submitted[-1]["action"] == {"Release": grant}
                 assert submitted[-1] == submitted[-2]
 
