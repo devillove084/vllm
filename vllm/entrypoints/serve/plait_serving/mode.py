@@ -280,8 +280,19 @@ class ModeController:
 
     def reset_evidence(self) -> None:
         self.previous = None
-        self.proposal = None
-        self.windows = 0
+        self.observe_proposal(None)
+
+    def observe_proposal(
+        self, proposal: tuple[Capacity, Capacity | Provision] | None
+    ) -> int:
+        if proposal is None:
+            self.windows = 0
+        elif proposal == self.proposal:
+            self.windows += 1
+        else:
+            self.windows = 1
+        self.proposal = proposal
+        return self.windows
 
     def watch(
         self, stop: threading.Event, snapshot: Callable[[], ModeView | None]
@@ -328,8 +339,7 @@ class ModeController:
             or current["arrivals"] < previous["arrivals"]
         ):
             self.previous = current
-            self.proposal = None
-            self.windows = 0
+            self.observe_proposal(None)
             return None
         elapsed = (current["uptime_ms"] - previous["uptime_ms"]) / 1000
         if elapsed < window_seconds:
@@ -385,8 +395,7 @@ class ModeController:
         ]
         incumbent = next((mode for mode in eligible if mode.versions == active), None)
         if incumbent is None:
-            self.proposal = None
-            self.windows = 0
+            self.observe_proposal(None)
             return
         bridges = {
             frozenset([target.bridge]): target
@@ -440,17 +449,14 @@ class ModeController:
                 default=None,
             )
         proposal = (incumbent, chosen[1]) if chosen is not None else None
-        self.windows = self.windows + 1 if proposal == self.proposal else 1
-        self.proposal = proposal
-        if chosen is None or self.windows < policy.stable_windows:
+        if self.observe_proposal(proposal) < policy.stable_windows or chosen is None:
             return
         score, target = chosen
         if (
             not self.ready(incumbent, routes, active, verify_http=False)
             or not self.current(view, snapshot, policy, incumbent, target)
         ):
-            self.proposal = None
-            self.windows = 0
+            self.observe_proposal(None)
             return
         if isinstance(target, Provision):
             if not self.calibrate(view, view.projection_routes(target), policy.calibration):
@@ -472,8 +478,7 @@ class ModeController:
                 f"with projected gain {score:.2f} requests",
                 flush=True,
             )
-        self.proposal = None
-        self.windows = 0
+        self.observe_proposal(None)
 
     def begin_reuse(
         self,
@@ -528,6 +533,7 @@ class ModeController:
         profiles: dict[frozenset[str], Capacity],
     ) -> None:
         if not self.current(view, snapshot, policy, bridge, target):
+            self.observe_proposal(None)
             return
         groups = {member.group for member in target.members}
         mode = next(
@@ -542,13 +548,18 @@ class ModeController:
             ),
             None,
         )
-        if mode is not None:
-            if self.current(view, snapshot, policy, bridge, target, mode):
-                self.switch(view.groups, view.active, mode.versions)
-                self.cooldown_until = time.monotonic() + policy.cooldown_seconds
-                print("Plait activated the layout prepared after device release", flush=True)
-        elif not self.calibrate(view, view.projection_routes(target), policy.calibration):
-            self.prepare(view, target)
+        if mode is None:
+            self.observe_proposal(None)
+            if not self.calibrate(view, view.projection_routes(target), policy.calibration):
+                self.prepare(view, target)
+            return
+        if self.observe_proposal((bridge, mode)) < policy.stable_windows:
+            return
+        self.observe_proposal(None)
+        if self.current(view, snapshot, policy, bridge, target, mode):
+            self.switch(view.groups, view.active, mode.versions)
+            self.cooldown_until = time.monotonic() + policy.cooldown_seconds
+            print("Plait activated the layout prepared after device release", flush=True)
 
     def current(
         self,

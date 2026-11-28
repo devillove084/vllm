@@ -1260,10 +1260,28 @@ class ModePolicyTest(unittest.TestCase):
         self.assertEqual(len(self.requests), 1)
         self.health.return_value = True
         self.sample(10)
+        self.assertEqual(len(self.requests), 1)
+        self.sample(10)
         self.assertEqual(
             [(change["expected"], change["target"]) for change in self.changes()],
             [(None, 2), (None, None), (None, None), (1, None)],
         )
+
+    def test_reuse_keeps_the_bridge_through_one_low_demand_window(self):
+        bridge, target = self.configure_device_reuse()
+        self.active = frozenset([bridge])
+        self.routes += ((Endpoint("127.0.0.1", 8005, target, "aggregated"),),)
+        self.ready = {target}
+        self.device_counts[target] = 4
+
+        self.sample(0, seconds=0)
+        for offered_rate in (14, 10, 14, 10):
+            self.sample(offered_rate)
+            self.assertEqual(self.requests, [])
+        self.sample(10)
+        self.assertEqual(len(self.requests), 1)
+        self.assertEqual(self.changes()[0]["target"], 2)
+        self.assertIsNone(self.changes()[3]["target"])
 
     def test_device_reuse_needs_a_feasible_preview_and_a_bridge_that_can_carry_load(self):
         self.configure_device_reuse()
@@ -1321,6 +1339,12 @@ class ModePolicyTest(unittest.TestCase):
 
         calibrator.run = SimpleNamespace(target=target_measurement)
         calibrator.poll.return_value = {"rps": 16, "valid_until_ms": 60_000}
+        self.sample(10)
+        self.assertEqual(len(self.requests), 1)
+        calibrator.poll.return_value = {"rps": 16, "valid_until_ms": 62_000}
+        self.sample(10)
+        self.assertEqual(len(self.requests), 1)
+        calibrator.run = None
         self.sample(10)
         self.assertEqual(self.changes()[0]["target"], 2)
         self.assertIsNone(self.changes()[3]["target"])
