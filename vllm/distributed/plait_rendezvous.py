@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from typing import TYPE_CHECKING
 
@@ -14,6 +14,10 @@ from vllm.distributed.plait_calibration import GemmCalibration
 from vllm.distributed.utils import create_tcp_store
 
 if TYPE_CHECKING:
+    import torch
+    from plait_nccl import CommHandle
+    from plait_nccl import NCCLLibrary as PlaitLibrary
+
     from vllm.config import ParallelConfig
 
 
@@ -41,18 +45,95 @@ class CommittedGroup:
                 f"Expected one committed Plait {axis.upper()} group for ranks {ranks}"
             )
         group = matches[0]
-        devices = [(host.lower(), ordinal) for host, ordinal in group["devices"]]
-        if len(devices) != len(ranks) or devices[slot][0] != config["host_id"].lower():
+        binding = cls.from_descriptor(config, group)
+        if (
+            len(binding.devices) != len(ranks)
+            or binding.devices[slot][0] != config["host_id"].lower()
+        ):
             raise ValueError(
                 f"Plait {axis.upper()} binding does not match worker {ranks[slot]}"
             )
+        return binding
+
+    @classmethod
+    def from_descriptor(cls, config: dict, group: dict) -> "CommittedGroup":
+        devices = [(host.lower(), ordinal) for host, ordinal in group["devices"]]
         calibration = group.get("compute_calibration")
         if calibration is not None:
             calibration = GemmCalibration(**calibration)
         egress = group.get("replicated_egress_bytes")
         if egress is not None and (type(egress) is not int or not 0 <= egress < 2**64):
-            raise ValueError("Plait replicated_egress_bytes must be an unsigned integer")
+            raise ValueError(
+                "Plait replicated_egress_bytes must be an unsigned integer"
+            )
         return cls(group["version"], config["seeds"], devices, calibration, egress)
+
+
+@dataclass
+class CommittedModelGroup:
+    """Hold both native axes until vLLM takes ownership of each handle."""
+
+    binding: CommittedGroup
+    rank: int
+    tensor_parallel: int
+    pipeline_parallel: int
+    _axes: dict[str, "tuple[PlaitLibrary, CommHandle]"] | None = field(
+        init=False, default=None
+    )
+
+    @classmethod
+    def load(cls, path: str, rank: int, tp: int, pp: int) -> "CommittedModelGroup":
+        with open(path, encoding="utf-8") as file:
+            config = json.load(file)
+        model = config.get("model_group")
+        if (
+            not isinstance(model, dict)
+            or "tp_groups" in config
+            or "pp_groups" in config
+            or tp < 2
+            or pp < 2
+            or model.get("tensor_parallel") != tp
+            or model.get("pipeline_parallel") != pp
+        ):
+            raise ValueError("committed Plait model group differs from vLLM TP × PP")
+        layout = list(range(tp * pp))
+        binding = CommittedGroup.from_descriptor(config, model)
+        if (
+            model.get("ranks") != layout
+            or not 0 <= rank < len(layout)
+            or len(set(binding.devices)) != len(layout)
+            or len(binding.devices) != len(layout)
+            or binding.devices[rank][0] != config["host_id"].lower()
+        ):
+            raise ValueError("committed Plait device layout differs from vLLM workers")
+        return cls(binding, rank, tp, pp)
+
+    def take_axis(
+        self, axis: str, ranks: list[int], device: "torch.device"
+    ) -> "tuple[CommittedGroup, tuple[PlaitLibrary, CommHandle]]":
+        from vllm.distributed.device_communicators.pynccl import (
+            join_committed_model_group,
+        )
+
+        stage, slot = divmod(self.rank, self.tensor_parallel)
+        if axis == "tp":
+            begin = stage * self.tensor_parallel
+            expected = range(begin, begin + self.tensor_parallel)
+            binding = self.binding
+        elif axis == "pp":
+            width = self.tensor_parallel * self.pipeline_parallel
+            expected = range(slot, width, self.tensor_parallel)
+            binding = replace(self.binding, compute_calibration=None)
+        else:
+            raise ValueError("expected a TP or PP communicator")
+        if ranks != list(expected):
+            raise ValueError(f"committed Plait {axis.upper()} slots differ from vLLM")
+        if self._axes is None:
+            library, tensor, pipeline = join_committed_model_group(
+                device, self.binding, self.rank, self.tensor_parallel
+            )
+            self._axes = {"tp": (library, tensor), "pp": (library, pipeline)}
+        return binding, self._axes.pop(axis)
 
 
 def _open_store(config: "ParallelConfig", *, is_master: bool) -> TCPStore:

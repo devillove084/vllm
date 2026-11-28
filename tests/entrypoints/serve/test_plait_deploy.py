@@ -20,6 +20,7 @@ from starlette.responses import Response, StreamingResponse
 from starlette.routing import Route
 from starlette.testclient import TestClient
 
+from vllm.distributed.plait_rendezvous import CommittedModelGroup
 from vllm.entrypoints.serve.plait_deploy import (
     Control,
     ControlUnavailable,
@@ -151,6 +152,65 @@ class TestPlaitDeployment(unittest.TestCase):
                 [self.first, 2],
                 [self.second, 1],
             ]
+
+    def test_mixed_recipe_starts_both_axes_with_one_device_binding(self):
+        recipe = "05" * 16
+        self.config = replace(
+            self.config,
+            layout_recipes={
+                recipe: {
+                    "width": 4,
+                    "tensor_parallel": 2,
+                    "pipeline_layers": [11, 17],
+                }
+            },
+        )
+        self.view["recipe"] = list(bytes.fromhex(recipe))
+        self.view["grants"].append({"device": {"node": [1] * 16, "ordinal": 7}})
+        placement = self.config.place(self.view)
+        engine = Engine(["vllm"], "/models/example", "CUDA_VISIBLE_DEVICES", [], {})
+        deploy = "vllm.entrypoints.serve.plait_deploy"
+        join_path = (
+            "vllm.distributed.device_communicators.pynccl.join_committed_model_group"
+        )
+        library, tp, pp = object(), object(), object()
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch(f"{deploy}.psutil.net_if_addrs", return_value={}),
+            patch(f"{deploy}.subprocess.Popen") as spawn,
+            patch(join_path, return_value=(library, tp, pp)) as join,
+        ):
+            worker = engine.start(
+                self.config, placement, self.second, Path(directory), self.control
+            )
+            assert isinstance(worker, WorkerProcess)
+            self.addCleanup(worker.lock.close)
+            command = spawn.call_args.args[0]
+            assert command[command.index("--tensor-parallel-size") + 1] == "2"
+            assert command[command.index("--pipeline-parallel-size") + 1] == "2"
+            env = spawn.call_args.kwargs["env"]
+            assert env["VLLM_PP_LAYER_PARTITION"] == "11,17"
+            path = env["VLLM_PLAIT_TP_GROUP_CONFIG"]
+            model = CommittedModelGroup.load(path, 3, 2, 2)
+            device = Mock()
+            with self.assertRaisesRegex(ValueError, "PP slots"):
+                model.take_axis("pp", [0, 3], device)
+            assert model.take_axis("tp", [2, 3], device)[1] == (library, tp)
+            assert model.take_axis("pp", [1, 3], device)[1] == (library, pp)
+            join.assert_called_once_with(device, model.binding, 3, 2)
+
+    def test_mixed_recipe_rejects_a_nonrectangular_width(self):
+        with self.assertRaisesRegex(ValueError, "valid TP × PP width"):
+            replace(
+                self.config,
+                layout_recipes={
+                    "05" * 16: {
+                        "width": 5,
+                        "tensor_parallel": 2,
+                        "pipeline_layers": [11, 17],
+                    }
+                },
+            )
 
     def test_recipe_rejects_invalid_stage_budgets(self):
         for layers, budgets in [

@@ -29,7 +29,8 @@ from vllm.utils.network_utils import get_ip
 from vllm.utils.torch_utils import current_stream
 
 if TYPE_CHECKING:
-    from plait_nccl import PeerRequest
+    from plait_nccl import CommHandle, PeerRequest
+    from plait_nccl import NCCLLibrary as PlaitLibrary
 
     from vllm.distributed.plait_rendezvous import CommittedGroup
 
@@ -54,6 +55,23 @@ def _load_collective_library(
     if index is None:
         index = torch.get_device_module(torch.device(device)).current_device()
     return PlaitLibrary(device=index)
+
+
+def join_committed_model_group(
+    device: torch.device, group: "CommittedGroup", rank: int, tensor_parallel: int
+) -> "tuple[PlaitLibrary, CommHandle, CommHandle]":
+    library = _load_collective_library(None, device)
+    with torch.accelerator.device_index(device.index):
+        tensor, pipeline = library.join_versioned_model_group(
+            get_ip(),
+            group.seeds,
+            group.version,
+            group.devices,
+            rank,
+            tensor_parallel,
+            replicated_egress_bytes=group.replicated_egress_bytes,
+        )
+    return library, tensor, pipeline
 
 
 def _stream_pointer(stream) -> cudaStream_t:
@@ -136,6 +154,7 @@ class PyNcclCommunicator:
         *,
         use_peer_group: bool = False,
         committed_group: "CommittedGroup | None" = None,
+        plait_axis: "tuple[PlaitLibrary, CommHandle] | None" = None,
     ):
         """Args:
             group: the process group to work on. If None, it will use the
@@ -170,7 +189,11 @@ class PyNcclCommunicator:
             self.disabled = True
             return
         try:
-            self.nccl = _load_collective_library(library_path, device)
+            self.nccl = (
+                _load_collective_library(library_path, device)
+                if plait_axis is None
+                else plait_axis[0]
+            )
         except Exception:
             if envs.VLLM_USE_PLAIT:
                 raise
@@ -192,7 +215,12 @@ class PyNcclCommunicator:
                 or dist.get_backend(group) != dist.Backend.GLOO
             ):
                 raise ValueError("Plait peer startup requires a Gloo process group")
-            self._init_comm(device, peer_group=group, committed_group=committed_group)
+            self._init_comm(
+                device,
+                peer_group=group,
+                committed_group=committed_group,
+                plait_handle=None if plait_axis is None else plait_axis[1],
+            )
             if committed_group is not None:
                 logger.info(
                     "vLLM joined committed Plait group %s", committed_group.version
@@ -232,6 +260,7 @@ class PyNcclCommunicator:
         *,
         peer_group: ProcessGroup | None = None,
         committed_group: "CommittedGroup | None" = None,
+        plait_handle: "CommHandle | None" = None,
     ) -> None:
         """Connect the communicator, then run the one-element warm-up."""
         if isinstance(device, int):
@@ -243,7 +272,9 @@ class PyNcclCommunicator:
         self.device = device
         # nccl communicator and stream will use this device
         with torch.accelerator.device_index(device.index):
-            if committed_group is not None:
+            if plait_handle is not None:
+                self.comm = plait_handle
+            elif committed_group is not None:
                 options = {}
                 if committed_group.replicated_egress_bytes is not None:
                     options["replicated_egress_bytes"] = (

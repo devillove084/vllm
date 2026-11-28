@@ -31,6 +31,8 @@ class NativeGroupHeaders:
             raise ValueError("group middleware requires a committed Plait launch")
         deployment = json.loads(Path(descriptor).read_text(encoding="utf-8"))
         groups = deployment.get("tp_groups", []) + deployment.get("pp_groups", [])
+        if "model_group" in deployment:
+            groups.append(deployment["model_group"])
         if len(groups) != 1 or not re.fullmatch(
             r"[a-f0-9]{32}@[1-9][0-9]*", groups[0]["version"]
         ):

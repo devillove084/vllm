@@ -166,6 +166,7 @@ class Deployment:
                 raise ValueError("layout_recipes must map IDs to recipe objects")
             width = recipe.get("width")
             layers = recipe.get("pipeline_layers", [])
+            tensor_parallel = recipe.get("tensor_parallel", 1 if layers else width)
             egress = recipe.get("replicated_egress_bytes")
             budgets = recipe.get("kv_cache_memory_bytes_by_stage")
             if (
@@ -173,27 +174,37 @@ class Deployment:
                 - {
                     "width",
                     "pipeline_layers",
+                    "tensor_parallel",
                     "replicated_egress_bytes",
                     "kv_cache_memory_bytes_by_stage",
                 }
                 or type(width) is not int
                 or not 0 < width < 2**32
                 or not isinstance(layers, list)
+                or type(tensor_parallel) is not int
+                or not 1 <= tensor_parallel <= width
+                or width % tensor_parallel
+                or (not layers and tensor_parallel != width)
                 or (
                     egress is not None
-                    and (layers or type(egress) is not int or not 0 <= egress < 2**64)
+                    and (
+                        (layers and tensor_parallel == 1)
+                        or type(egress) is not int
+                        or not 0 <= egress < 2**64
+                    )
                 )
                 or (
                     layers
                     and (
-                        len(layers) != width
-                        or width < 2
+                        len(layers) != width // tensor_parallel
+                        or len(layers) < 2
                         or any(type(layer) is not int or layer < 1 for layer in layers)
                     )
                 )
             ):
                 raise ValueError(
-                    "layout recipe needs a valid width, layers and TP AllReduce budget"
+                    "layout recipe needs a valid TP × PP width, layers "
+                    "and TP AllReduce budget"
                 )
             if budgets is not None and (
                 not layers
@@ -244,6 +255,7 @@ class Deployment:
         layers = (self.pipeline_layers or {}).get(str(width), ())
         egress = None
         budgets = None
+        tensor_parallel = None
         if "recipe" not in view and self.layout_recipes:
             raise ValueError(
                 "layout recipes require a recipe-aware Plait control plane"
@@ -256,6 +268,7 @@ class Deployment:
                     f"missing launch definition for committed recipe {recipe_id}"
                 )
             layers = recipe.get("pipeline_layers", ())
+            tensor_parallel = recipe.get("tensor_parallel")
             egress = recipe.get("replicated_egress_bytes")
             budgets = recipe.get("kv_cache_memory_bytes_by_stage")
         offset = (version["epoch"] - 1) % self.epoch_ports
@@ -269,6 +282,7 @@ class Deployment:
             tuple(layers),
             egress,
             tuple(budgets) if budgets is not None else None,
+            tensor_parallel,
         )
 
 
@@ -283,6 +297,15 @@ class Placement:
     pipeline_layers: tuple[int, ...] = ()
     replicated_egress_bytes: int | None = None
     kv_cache_memory_bytes_by_stage: tuple[int, ...] | None = None
+    tensor_parallel: int | None = None
+
+    @property
+    def parallel_sizes(self) -> tuple[int, int]:
+        pp = len(self.pipeline_layers) or 1
+        tp = self.tensor_parallel
+        if tp is None:
+            tp = sum(map(len, self.devices.values())) // pp
+        return tp, pp
 
     @property
     def origin(self) -> str:
@@ -305,6 +328,11 @@ class Placement:
             group["compute_calibration"] = calibration
         if self.replicated_egress_bytes is not None:
             group["replicated_egress_bytes"] = self.replicated_egress_bytes
+        tp, pp = self.parallel_sizes
+        if tp > 1 and pp > 1:
+            group["tensor_parallel"] = tp
+            group["pipeline_parallel"] = pp
+            return {"host_id": host, "seeds": seeds, "model_group": group}
         axis = "pp" if self.pipeline_layers else "tp"
         return {"host_id": host, "seeds": seeds, f"{axis}_groups": [group]}
 
@@ -635,8 +663,7 @@ class Engine:
         nodes = list(placement.devices)
         counts = [len(placement.devices[node]) for node in nodes]
         node_rank = nodes.index(host)
-        tp = 1 if placement.pipeline_layers else sum(counts)
-        pp = len(placement.pipeline_layers) or 1
+        tp, pp = placement.parallel_sizes
         command = [
             *self.argv,
             "serve",

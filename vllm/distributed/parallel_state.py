@@ -47,7 +47,11 @@ import vllm.envs as envs
 from vllm.distributed.device_communicators.base_device_communicator import (
     DeviceCommunicatorBase,
 )
-from vllm.distributed.plait_rendezvous import CommittedGroup, plait_worker_store
+from vllm.distributed.plait_rendezvous import (
+    CommittedGroup,
+    CommittedModelGroup,
+    plait_worker_store,
+)
 from vllm.distributed.utils import (
     StatelessProcessGroup,
     get_cached_tcp_store_client,
@@ -1510,6 +1514,7 @@ def init_model_parallel_group(
     group_name: str | None = None,
     use_device_communicator: bool = True,
     use_all2all: bool = False,
+    plait_model_group: CommittedModelGroup | None = None,
 ) -> GroupCoordinator:
     use_plait = (
         envs.VLLM_USE_PLAIT and group_name in ("tp", "pp") and use_device_communicator
@@ -1539,11 +1544,17 @@ def init_model_parallel_group(
             device = torch.device(current_platform.device_type, device)
         try:
             binding = None
+            plait_axis = None
             if binding_path is not None:
                 assert group_name is not None
-                binding = CommittedGroup.load(
-                    binding_path, group.ranks, group.rank_in_group, group_name
-                )
+                if plait_model_group is not None:
+                    binding, plait_axis = plait_model_group.take_axis(
+                        group_name, group.ranks, device
+                    )
+                else:
+                    binding = CommittedGroup.load(
+                        binding_path, group.ranks, group.rank_in_group, group_name
+                    )
                 if binding is not None and (
                     torch.distributed.get_rank(group.cpu_group) != group.rank_in_group
                 ):
@@ -1551,7 +1562,11 @@ def init_model_parallel_group(
             if group.world_size == 1 and binding is None:
                 return group
             communicator = PlaitCommunicator(
-                group.cpu_group, device, group.unique_name, binding
+                group.cpu_group,
+                device,
+                group.unique_name,
+                binding,
+                plait_axis=plait_axis,
             )
             group.device_communicator = communicator
             if group_name == "pp":
@@ -2136,6 +2151,7 @@ def initialize_model_parallel(
             get_world_group().device_group
         )
 
+    plait_model_group = None
     if envs.VLLM_USE_PLAIT:
         if (
             world_size != tensor_model_parallel_size * pipeline_model_parallel_size
@@ -2150,6 +2166,18 @@ def initialize_model_parallel(
             and parallel_config.distributed_executor_backend != "mp"
         ):
             raise ValueError("Plait pipeline parallelism requires the mp executor")
+        binding_path = envs.VLLM_PLAIT_TP_GROUP_CONFIG
+        if (
+            binding_path is not None
+            and tensor_model_parallel_size > 1
+            and pipeline_model_parallel_size > 1
+        ):
+            plait_model_group = CommittedModelGroup.load(
+                binding_path,
+                rank,
+                tensor_model_parallel_size,
+                pipeline_model_parallel_size,
+            )
         backend = "gloo"
 
     # the layout order is: ExternalDP x DP x PP x PCP x TP
@@ -2184,6 +2212,7 @@ def initialize_model_parallel(
         backend,
         use_message_queue_broadcaster=True,
         group_name="tp",
+        plait_model_group=plait_model_group,
     )
 
     global _ETP
@@ -2294,7 +2323,11 @@ def initialize_model_parallel(
         )
         group_ranks = [x.tolist() for x in group_ranks]
     _PP = init_model_parallel_group(
-        group_ranks, get_world_group().local_rank, backend, group_name="pp"
+        group_ranks,
+        get_world_group().local_rank,
+        backend,
+        group_name="pp",
+        plait_model_group=plait_model_group,
     )
 
     global _DP

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 import torch
 from torch.distributed import ProcessGroup
@@ -13,6 +14,10 @@ from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
 from vllm.distributed.plait_rendezvous import CommittedGroup
 from vllm.logger import init_logger
 from vllm.utils.network_utils import get_ip
+
+if TYPE_CHECKING:
+    from plait_nccl import CommHandle
+    from plait_nccl import NCCLLibrary as PlaitLibrary
 
 logger = init_logger(__name__)
 
@@ -26,10 +31,16 @@ class PlaitCommunicator(DeviceCommunicatorBase):
         device: torch.device,
         unique_name: str,
         committed_group: CommittedGroup | None = None,
+        *,
+        plait_axis: "tuple[PlaitLibrary, CommHandle] | None" = None,
     ):
         super().__init__(cpu_group, device, unique_name=unique_name)
         self.pynccl_comm = PyNcclCommunicator(
-            cpu_group, device, use_peer_group=True, committed_group=committed_group
+            cpu_group,
+            device,
+            use_peer_group=True,
+            committed_group=committed_group,
+            plait_axis=plait_axis,
         )
         if self.pynccl_comm.disabled:
             raise RuntimeError(f"Plait communicator {unique_name} is disabled")
