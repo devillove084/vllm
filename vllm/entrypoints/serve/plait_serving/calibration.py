@@ -98,7 +98,6 @@ class Settings:
             "placement": ",".join(sorted(target.versions)),
             "input-tokens": self.input_tokens,
             "output-tokens": self.output_tokens,
-            "vllm": self.vllm,
             "prompts": self.prompts,
             "warmups": self.warmups,
             "ttft-ms": self.ttft_ms,
@@ -114,6 +113,10 @@ class Settings:
         ]
         for flag, value in options.items():
             command.extend([f"--{flag}", str(value)])
+        if self.vllm == "vllm":
+            command.append("--in-process")
+        else:
+            command.extend(["--vllm", self.vllm])
         if self.warmup_decode_widths:
             command.extend(
                 ["--warmup-decode-widths", *map(str, self.warmup_decode_widths)]

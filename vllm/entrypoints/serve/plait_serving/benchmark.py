@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import math
 import re
@@ -76,10 +77,7 @@ def run_trial(
     args: argparse.Namespace, rate: float, seed: int, directory: Path
 ) -> dict:
     report = directory / "trial.json"
-    command = [
-        args.vllm,
-        "bench",
-        "serve",
+    options = [
         "--backend",
         "openai",
         "--base-url",
@@ -126,7 +124,11 @@ def run_trial(
     ]
     start = time.monotonic()
     kv_before = transferred_bytes(args.metrics_url)
-    subprocess.run(command, check=True)
+    report.unlink(missing_ok=True)
+    if args.in_process:
+        run_in_process(options)
+    else:
+        subprocess.run([args.vllm or "vllm", "bench", "serve", *options], check=True)
     kv_after = transferred_bytes(args.metrics_url)
     interval = time.monotonic() - start
     finished = time.time_ns() // 1_000_000
@@ -158,9 +160,28 @@ def run_trial(
     }
 
 
+def run_in_process(options: list[str]) -> None:
+    from vllm.benchmarks import serve
+    from vllm.utils.argparse_utils import FlexibleArgumentParser
+
+    parser = FlexibleArgumentParser()
+    serve.add_cli_args(parser)
+    try:
+        serve.main(parser.parse_args(options))
+    finally:
+        # vLLM freezes the GC heap during a trial. Release it between trials.
+        gc.unfreeze()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--vllm", default="vllm")
+    runner = parser.add_mutually_exclusive_group()
+    runner.add_argument("--vllm", help="external vLLM CLI executable (default: vllm)")
+    runner.add_argument(
+        "--in-process",
+        action="store_true",
+        help="run timed trials in this calibration process",
+    )
     parser.add_argument("--url", required=True, help="OpenAI HTTP origin")
     parser.add_argument(
         "--model", required=True, help="model artifact used to load the tokenizer"

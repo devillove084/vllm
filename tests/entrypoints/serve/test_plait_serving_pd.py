@@ -441,6 +441,52 @@ class LaunchTest(unittest.TestCase):
 
 
 class CalibrationTest(unittest.TestCase):
+    def test_builtin_runner_parses_each_seed_with_the_vllm_benchmark(self):
+        settings = Settings("/model", 64, 8, (2,), (7, 23), 2000, 500, prompts=2)
+        endpoint = Endpoint("127.0.0.1", 8000, "01" * 16 + "@1", "aggregated")
+        target = Target(1, frozenset(), ((endpoint,),), 1)
+
+        def trial(args):
+            Path(args.result_dir, args.result_filename).write_text(
+                json.dumps(
+                    {
+                        "num_prompts": args.num_prompts,
+                        "completed": 2,
+                        "failed": 0,
+                        "request_goodput": 2.0,
+                        "duration": 1.0,
+                    }
+                )
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "capacity.json"
+            command = settings.command("http://127.0.0.1:7000", "test", target, output)
+            with (
+                patch("sys.argv", command[2:]),
+                patch("vllm.benchmarks.serve.main", side_effect=trial) as run,
+                patch.object(benchmark.subprocess, "run") as spawn,
+            ):
+                benchmark.main()
+            spawn.assert_not_called()
+            self.assertEqual(
+                [call.args[0].seed for call in run.call_args_list], [7, 23]
+            )
+            for call in run.call_args_list:
+                args = call.args[0]
+                self.assertEqual(args.base_url, "http://127.0.0.1:7000")
+                self.assertEqual(args.served_model_name, "test")
+                self.assertEqual(args.request_rate, 2)
+                self.assertEqual(args.goodput, ["ttft:2000.0", "tpot:500.0"])
+            self.assertEqual(json.loads(output.read_text())["slo_profile"]["rps"], 2)
+
+    def test_calibration_keeps_an_explicit_benchmark_executable(self):
+        settings = Settings("/model", 16, 8, (2,), (1,), 100, 20, vllm="/custom/vllm")
+        target = Target(1, frozenset(), (), 1)
+        command = settings.command("http://localhost:7000", "test", target, Path("out"))
+        self.assertNotIn("--in-process", command)
+        self.assertEqual(command[command.index("--vllm") + 1], "/custom/vllm")
+
     def test_a_late_writer_preserves_the_newer_measurement_of_the_same_layout(self):
         with tempfile.TemporaryDirectory() as directory:
             store = ProfileStore(Path(directory) / "capacity.json")
