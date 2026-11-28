@@ -3,8 +3,6 @@
 """Launch vLLM from Plait grants and publish healthy, versioned origins."""
 
 import argparse
-import ctypes
-import errno
 import fcntl
 import ipaddress
 import json
@@ -13,7 +11,6 @@ import re
 import signal
 import subprocess
 import sys
-import tempfile
 import time
 import uuid
 from contextlib import ExitStack, closing, suppress
@@ -26,6 +23,12 @@ from typing import IO, Any
 
 import psutil
 
+from vllm.entrypoints.serve.plait_engine_owner import (
+    ENGINE_STOP_GRACE_SECONDS,
+    EXEC_REJECTIONS,
+    sync_directory,
+    write_json,
+)
 from vllm.entrypoints.serve.plait_version import (
     DRAIN_PATH,
     GROUP_ROLES,
@@ -36,9 +39,6 @@ from vllm.entrypoints.serve.plait_version import (
 
 class ControlUnavailable(RuntimeError):
     pass
-
-
-ENGINE_STOP_GRACE_SECONDS = 10
 
 
 class Control:
@@ -337,6 +337,7 @@ class EngineGrantReturn:
                     or prefix != f"{group_id}@{epoch}"
                     or evidence not in ("failed", "stopped")
                     or ("error" in record) != (evidence == "failed")
+                    or type(record.get("unexpected", False)) is not bool
                     or not isinstance(record["grants"], list)
                     or not record["grants"]
                 ):
@@ -359,20 +360,14 @@ class EngineGrantReturn:
             or local_grants(view, self.record["host"]) != grants
         ):
             raise ValueError(f"engine grants changed for {self.path.name}")
-        origin = list(parse_id(self.record["origin"]))
-        if view["phase"] == "Preparing" and "error" in self.record:
-            apply_operation(
-                control,
-                {
-                    "id": {"origin": origin, "counter": 1},
-                    "action": {
-                        "ReportFailure": {"grant": grants[0], "fault": "Device"}
-                    },
-                },
-            )
-            return False
         if view["phase"] not in ("Revoked", "Retired"):
+            if self.record.get("unexpected") or (
+                view["phase"] == "Preparing" and "error" in self.record
+            ):
+                report_exit(control, self.record)
+                return False
             raise ValueError(f"engine grants cannot return during {view['phase']}")
+        origin = list(parse_id(self.record["origin"]))
         # Use the original IDs even when a release committed before a crash.
         for counter, grant in enumerate(grants, start=2):
             apply_operation(
@@ -382,10 +377,12 @@ class EngineGrantReturn:
                     "action": {"Release": grant},
                 },
             )
+        version_name = self.path.name.rsplit(".", 2)[0]
+        for suffix in ("stop.json", "owner.json"):
+            (self.path.parent / f"{version_name}.{suffix}").unlink(missing_ok=True)
         self.path.unlink(missing_ok=True)
         sync_directory(self.path.parent)
         self.lock.close()
-        version_name = self.path.name.rsplit(".", 2)[0]
         print(
             f"Released local Plait grants for {version_name}",
             flush=True,
@@ -402,6 +399,85 @@ def local_grants(view: dict, host: str) -> list[dict]:
         ),
         key=lambda grant: grant["device"]["ordinal"],
     )
+
+
+def report_exit(control: Control, record: dict) -> None:
+    apply_operation(
+        control,
+        {
+            "id": {"origin": list(parse_id(record["origin"])), "counter": 1},
+            "action": {
+                "ReportFailure": {"grant": record["grants"][0], "fault": "Device"}
+            },
+        },
+    )
+
+
+def reconcile_owner(
+    path: Path, deployment: Deployment, control: Control, host: str
+) -> None:
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return
+    try:
+        version = record["version"]
+        epoch = version["epoch"]
+        origin = list(parse_id(record["origin"]))
+        if (
+            record["host"] != host
+            or version["group"] != list(parse_id(deployment.group_id))
+            or type(epoch) is not int
+            or epoch <= 0
+            or path.name != f"{deployment.group_id}@{epoch}.owner.json"
+            or record["role"] not in GROUP_ROLES
+            or type(record.get("failed", False)) is not bool
+            or not isinstance(record["grants"], list)
+            or not record["grants"]
+        ):
+            raise ValueError("mismatched owner identity or grants")
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError(f"invalid engine ownership record {path.name}") from error
+
+    view = control.request("view", version=version)["group"]
+    if view is None or (
+        not record.get("failed") and view["phase"] not in ("Draining", "Revoked")
+    ):
+        return
+    view = control.observe(version)
+    if view is None:
+        return
+    if view["version"] != version or local_grants(view, host) != record["grants"]:
+        raise ValueError(f"engine grants changed for {path.name}")
+    phase = view["phase"]
+    prefix = path.name.removesuffix(".owner.json")
+    if phase == "Revoked":
+        stop = path.with_name(f"{prefix}.stop.json")
+        command = {"origin": record["origin"]}
+        try:
+            current = json.loads(stop.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError):
+            current = None
+        if current != command:
+            write_json(stop, command)
+    elif phase != "Retired" and record.get("failed"):
+        report_exit(control, record)
+    elif phase == "Draining":
+        api_host = min(bytes(grant["device"]["node"]).hex() for grant in view["grants"])
+        if host == api_host:
+            bound = control.observe(version, with_recipe=True)
+            if bound is None or bound["phase"] != "Draining":
+                return
+            placement = deployment.place(bound)
+            path.with_name(f"{prefix}.drain").touch(exist_ok=True)
+            if versioned_status(placement, DRAIN_PATH, 204, role=record["role"]):
+                apply_operation(
+                    control,
+                    {
+                        "id": {"origin": origin, "counter": len(record["grants"]) + 2},
+                        "action": {"Revoke": version},
+                    },
+                )
 
 
 @dataclass
@@ -465,7 +541,7 @@ class Engine:
         host: str,
         state: Path,
         control: Control,
-    ) -> "WorkerProcess | EngineGrantReturn | None":
+    ) -> "WorkerProcess | EngineGrantReturn | subprocess.Popen[bytes] | None":
         descriptor = state / f"{placement.version_text}.json"
         nodes = list(placement.devices)
         counts = [len(placement.devices[node]) for node in nodes]
@@ -550,7 +626,11 @@ class Engine:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             failed = descriptor.with_suffix(".failed.json")
             stopped = descriptor.with_suffix(".stopped.json")
-            if failed.exists() or stopped.exists():
+            if (
+                failed.exists()
+                or stopped.exists()
+                or descriptor.with_suffix(".owner.json").exists()
+            ):
                 return None
             view = control.observe(placement.version)
             if view is None or view["phase"] != "Preparing":
@@ -568,6 +648,30 @@ class Engine:
             )
             if self.api_role != "aggregated":
                 binding["api_role"] = self.api_role
+            if sys.platform == "linux":
+                if prior_launch:
+                    raise ValueError("earlier engine has no durable ownership record")
+                record = {
+                    "host": host,
+                    "version": placement.version,
+                    "grants": grants,
+                    "origin": uuid.uuid4().hex,
+                    "role": self.api_role,
+                }
+                return subprocess.Popen(
+                    [
+                        sys.executable,
+                        str(Path(__file__).with_name("plait_engine_owner.py")),
+                        str(descriptor.resolve()),
+                        str(lock.fileno()),
+                        json.dumps(record),
+                        json.dumps(binding),
+                        *command,
+                    ],
+                    env=env,
+                    start_new_session=True,
+                    pass_fds=(lock.fileno(),),
+                )
             descriptor.write_text(json.dumps(binding), encoding="utf-8")
             try:
                 process = subprocess.Popen(
@@ -576,12 +680,7 @@ class Engine:
             except OSError as error:
                 # An earlier launch may have left descendants. Only a first
                 # attempt with a definite exec rejection proves no process ran.
-                if prior_launch or error.errno not in (
-                    errno.ENOENT,
-                    errno.ENOTDIR,
-                    errno.EACCES,
-                    errno.ENOEXEC,
-                ):
+                if prior_launch or error.errno not in EXEC_REJECTIONS:
                     raise
                 returning = EngineGrantReturn.persist(
                     failed, host, placement.version, grants, lock, error
@@ -623,30 +722,6 @@ def versioned_status(
 
 def healthy(placement: Placement) -> bool:
     return versioned_status(placement, "/health", 200)
-
-
-def sync_directory(path: Path) -> None:
-    directory = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        os.fsync(directory)
-    finally:
-        os.close(directory)
-
-
-def write_json(path: Path, document: dict) -> None:
-    with tempfile.NamedTemporaryFile(
-        "w", encoding="utf-8", dir=path.parent, delete=False
-    ) as file:
-        pending = Path(file.name)
-        try:
-            json.dump(document, file)
-            file.flush()
-            os.fsync(file.fileno())
-            file.close()
-            pending.replace(path)
-            sync_directory(path.parent)
-        finally:
-            pending.unlink(missing_ok=True)
 
 
 def publish(path: Path, placement: Placement) -> None:
@@ -782,16 +857,6 @@ class WorkerProcess:
             os.killpg(self.process.pid, sig)
 
 
-def reap_orphaned_workers() -> None:
-    if sys.platform == "linux":
-        # Keep orphaned vLLM workers attached to this launcher, including
-        # inside containers whose PID 1 does not reap children.
-        libc = ctypes.CDLL(None, use_errno=True)
-        if libc.prctl(36, 1, 0, 0, 0) != 0:  # PR_SET_CHILD_SUBREAPER
-            error = ctypes.get_errno()
-            raise OSError(error, os.strerror(error))
-
-
 def supervise(
     deployment: Deployment,
     control: Control,
@@ -803,15 +868,29 @@ def supervise(
 ) -> None:
     group = list(parse_id(deployment.group_id))
     children: dict[int, WorkerProcess] = {}
+    owners: dict[int, subprocess.Popen[bytes]] = {}
     grant_returns: dict[Path, EngineGrantReturn] = {}
     last_error = None
-    if engine is not None:
-        reap_orphaned_workers()
     try:
         local_errors: dict[int, str] = {}
         return_errors: dict[Path, str] = {}
+        owner_errors: dict[Path, str] = {}
         while True:
             if engine is not None and state is not None and host is not None:
+                for epoch, owner in list(owners.items()):
+                    if owner.poll() is not None:
+                        del owners[epoch]
+                for owner_path in state.glob(f"{deployment.group_id}@*.owner.json"):
+                    try:
+                        reconcile_owner(owner_path, deployment, control, host)
+                        owner_errors.pop(owner_path, None)
+                    except (ControlUnavailable, OSError, ValueError) as error:
+                        if owner_errors.get(owner_path) != str(error):
+                            owner_errors[owner_path] = str(error)
+                            print(
+                                f"Plait deployment for {owner_path.name}: {error}",
+                                flush=True,
+                            )
                 journals = set(state.glob(f"{deployment.group_id}@*.failed.json"))
                 journals.update(state.glob(f"{deployment.group_id}@*.stopped.json"))
                 for journal in sorted(journals.union(grant_returns)):
@@ -856,6 +935,7 @@ def supervise(
                         engine is not None
                         and phase == "Preparing"
                         and epoch not in children
+                        and epoch not in owners
                     )
                     route = (
                         router is not None
@@ -886,8 +966,10 @@ def supervise(
                                         f"{process.record['error']}",
                                         flush=True,
                                     )
-                                elif process is not None:
+                                elif isinstance(process, WorkerProcess):
                                     children[epoch] = process
+                                elif process is not None:
+                                    owners[epoch] = process
                             if route and router is not None:
                                 router.reconcile(control, placement, phase)
                 last_error = None

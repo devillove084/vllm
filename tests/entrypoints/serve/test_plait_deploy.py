@@ -26,6 +26,7 @@ from vllm.entrypoints.serve.plait_deploy import (
     EngineGrantReturn,
     RoutePublisher,
     WorkerProcess,
+    reconcile_owner,
 )
 from vllm.entrypoints.serve.plait_version import (
     DRAIN_PATH,
@@ -36,6 +37,11 @@ from vllm.entrypoints.serve.plait_version import (
 
 class TestPlaitDeployment(unittest.TestCase):
     def setUp(self):
+        # Direct process-group behavior is still used on POSIX hosts without
+        # the Linux owner. Test the Linux launcher explicitly below.
+        platform = patch("vllm.entrypoints.serve.plait_deploy.sys.platform", "darwin")
+        platform.start()
+        self.addCleanup(platform.stop)
         self.first, self.second = "01" * 16, "02" * 16
         self.config = Deployment(
             group_id="03" * 16,
@@ -415,6 +421,58 @@ class TestPlaitDeployment(unittest.TestCase):
             )
             spawn.assert_not_called()
             assert not list(Path(directory).glob("*.json"))
+
+    def test_linux_engine_publishes_stop_for_the_recorded_instance(self):
+        module = "vllm.entrypoints.serve.plait_deploy"
+        engine = Engine(["vllm"], "/models/example", "CUDA_VISIBLE_DEVICES", [], {})
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch(f"{module}.sys.platform", "linux"),
+            patch(f"{module}.subprocess.Popen") as spawn,
+        ):
+            state = Path(directory)
+            assert (
+                engine.start(
+                    self.config, self.placement, self.first, state, self.control
+                )
+                is spawn.return_value
+            )
+            args = spawn.call_args.args[0]
+            assert Path(args[1]).name == "plait_engine_owner.py"
+            descriptor = Path(args[2])
+            assert not descriptor.exists()
+            record = json.loads(args[4])
+            owner = descriptor.with_suffix(".owner.json")
+            owner.write_text(json.dumps(record))
+            stop = descriptor.with_suffix(".stop.json")
+            self.control.request.return_value = {"group": self.view}
+            reconcile_owner(owner, self.config, self.control, self.first)
+            assert not stop.exists()
+
+            self.control.request.return_value = {
+                "group": {**self.view, "phase": "Revoked"}
+            }
+            reconcile_owner(owner, self.config, self.control, self.first)
+            assert not stop.exists()  # The ordered observation still says Preparing.
+            self.control.observe.return_value = {
+                **self.view,
+                "phase": "Revoked",
+                "grants": [dict(g, fence=2) for g in self.view["grants"]],
+            }
+            with self.assertRaisesRegex(ValueError, "grants changed"):
+                reconcile_owner(owner, self.config, self.control, self.first)
+            assert not stop.exists()
+            stop.write_text(json.dumps({"origin": "ff" * 16}))
+            self.control.observe.return_value = {**self.view, "phase": "Revoked"}
+            reconcile_owner(owner, self.config, self.control, self.first)
+            assert json.loads(stop.read_text()) == {"origin": record["origin"]}
+            assert (
+                engine.start(
+                    self.config, self.placement, self.first, state, self.control
+                )
+                is None
+            )
+            spawn.assert_called_once()
 
     def test_worker_releases_only_after_process_group_exit(self):
         with tempfile.TemporaryDirectory() as directory:
