@@ -7,6 +7,7 @@ import json
 import signal
 import tempfile
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
 from socket import AF_INET
 from types import SimpleNamespace
@@ -26,6 +27,7 @@ from vllm.entrypoints.serve.plait_deploy import (
     EngineGrantReturn,
     RoutePublisher,
     WorkerProcess,
+    reconcile_orphan_cgroup,
     reconcile_owner,
 )
 from vllm.entrypoints.serve.plait_version import (
@@ -473,6 +475,62 @@ class TestPlaitDeployment(unittest.TestCase):
                 is None
             )
             spawn.assert_called_once()
+
+    def test_orphan_cgroup_requires_exact_revoked_grants_and_empty_tree(self):
+        module = "vllm.entrypoints.serve.plait_deploy"
+        version = self.placement.version
+        grant = self.view["grants"][1]
+        record = {
+            "version": version,
+            "host": self.first,
+            "grants": [grant],
+            "origin": "ab" * 16,
+            "cgroup": {},
+        }
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch(f"{module}.verified_cgroup", return_value=nullcontext(7)),
+            patch(f"{module}.write_control") as write,
+            patch(f"{module}.populated", return_value=True) as populated,
+        ):
+            prefix = self.placement.version_text
+            root = Path(directory)
+            path = root / f"{prefix}.owner.json"
+            journal = root / f"{prefix}.stopped.json"
+            path.write_text(json.dumps(record))
+            with (root / f"{prefix}.lock").open("a") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                assert not reconcile_orphan_cgroup(
+                    path, self.control, record, self.first
+                )
+                self.control.observe.assert_not_called()
+            self.control.observe.return_value = {**self.view, "phase": "Active"}
+            self.control.request.return_value = {"result": {"Ok": {}}}
+            assert reconcile_orphan_cgroup(path, self.control, record, self.first)
+            operation = self.control.request.call_args.kwargs["operation"]
+            assert operation["action"] == {
+                "ReportFailure": {"grant": grant, "fault": "Device"}
+            }
+            write.assert_not_called()
+            assert not journal.exists()
+
+            self.control.observe.return_value = {
+                **self.view,
+                "phase": "Revoked",
+                "grants": [dict(grant, fence=13)],
+            }
+            with self.assertRaisesRegex(ValueError, "grants changed"):
+                reconcile_orphan_cgroup(path, self.control, record, self.first)
+            write.assert_not_called()
+            self.control.observe.return_value = {**self.view, "phase": "Revoked"}
+            assert reconcile_orphan_cgroup(path, self.control, record, self.first)
+            write.assert_called_once_with(7, "cgroup.kill", "1")
+            assert not journal.exists()
+            populated.return_value = False
+            assert reconcile_orphan_cgroup(path, self.control, record, self.first)
+            assert json.loads(journal.read_text()) == {
+                key: record[key] for key in ("host", "version", "grants", "origin")
+            }
 
     def test_worker_releases_only_after_process_group_exit(self):
         with tempfile.TemporaryDirectory() as directory:

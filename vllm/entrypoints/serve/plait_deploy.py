@@ -23,6 +23,13 @@ from typing import IO, Any
 
 import psutil
 
+from vllm.entrypoints.serve.plait_engine_cgroup import (
+    known_populated,
+    populated,
+    remove_cgroup,
+    verified_cgroup,
+    write_control,
+)
 from vllm.entrypoints.serve.plait_engine_owner import (
     ENGINE_STOP_GRACE_SECONDS,
     EXEC_REJECTIONS,
@@ -367,6 +374,18 @@ class EngineGrantReturn:
                 report_exit(control, self.record)
                 return False
             raise ValueError(f"engine grants cannot return during {view['phase']}")
+        version_name = self.path.name.rsplit(".", 2)[0]
+        owner = self.path.parent / f"{version_name}.owner.json"
+        try:
+            owner_record = json.loads(owner.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            owner_record = {}
+        contained = (
+            owner_record.get("origin") == self.record["origin"]
+            and "cgroup" in owner_record
+        )
+        if contained and known_populated(owner_record):
+            return False
         origin = list(parse_id(self.record["origin"]))
         # Use the original IDs even when a release committed before a crash.
         for counter, grant in enumerate(grants, start=2):
@@ -377,7 +396,8 @@ class EngineGrantReturn:
                     "action": {"Release": grant},
                 },
             )
-        version_name = self.path.name.rsplit(".", 2)[0]
+        if contained:
+            remove_cgroup(owner_record)
         for suffix in ("stop.json", "owner.json"):
             (self.path.parent / f"{version_name}.{suffix}").unlink(missing_ok=True)
         self.path.unlink(missing_ok=True)
@@ -413,6 +433,48 @@ def report_exit(control: Control, record: dict) -> None:
     )
 
 
+def reconcile_orphan_cgroup(
+    path: Path, control: Control, record: dict, host: str
+) -> bool:
+    prefix = path.name.removesuffix(".owner.json")
+    stopped = path.with_name(f"{prefix}.stopped.json")
+    failed = path.with_name(f"{prefix}.failed.json")
+    with path.with_name(f"{prefix}.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+        if stopped.exists() or failed.exists():
+            return True
+        try:
+            current = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return True
+        if current != record:
+            return True  # Revalidate the new record on the next iteration.
+        with verified_cgroup(record) as fd:
+            version = record["version"]
+            view = control.observe(version)
+            if view is None:
+                return True
+            if (
+                view["version"] != version
+                or local_grants(view, host) != record["grants"]
+            ):
+                raise ValueError(f"engine grants changed for {path.name}")
+            if view["phase"] not in ("Revoked", "Retired"):
+                report_exit(control, record)
+                return True
+            if populated(fd):
+                write_control(fd, "cgroup.kill", "1")
+                return True
+            write_json(
+                stopped,
+                {key: record[key] for key in ("host", "version", "grants", "origin")},
+            )
+    return True
+
+
 def reconcile_owner(
     path: Path, deployment: Deployment, control: Control, host: str
 ) -> None:
@@ -439,6 +501,8 @@ def reconcile_owner(
     except (KeyError, TypeError, ValueError) as error:
         raise ValueError(f"invalid engine ownership record {path.name}") from error
 
+    if "cgroup" in record and reconcile_orphan_cgroup(path, control, record, host):
+        return
     view = control.request("view", version=version)["group"]
     if view is None or (
         not record.get("failed") and view["phase"] not in ("Draining", "Revoked")
@@ -488,12 +552,17 @@ class Engine:
     args: list[str]
     env: dict[str, str]
     api_role: str = "aggregated"
+    cgroup_root: str | None = None
 
     def __post_init__(self) -> None:
         if not self.argv or not self.model or not self.device_env:
             raise ValueError("engine needs an executable, model and device mask")
         if self.api_role not in GROUP_ROLES:
             raise ValueError("expected an aggregated, prefill or decode API role")
+        if self.cgroup_root is not None and (
+            sys.platform != "linux" or not Path(self.cgroup_root).is_absolute()
+        ):
+            raise ValueError("engine cgroup_root requires an absolute Linux path")
         reserved = {
             "--host",
             "--port",
@@ -658,6 +727,8 @@ class Engine:
                     "origin": uuid.uuid4().hex,
                     "role": self.api_role,
                 }
+                if self.cgroup_root is not None:
+                    record["cgroup_root"] = self.cgroup_root
                 return subprocess.Popen(
                     [
                         sys.executable,

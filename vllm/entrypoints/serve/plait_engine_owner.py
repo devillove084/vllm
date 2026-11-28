@@ -15,6 +15,11 @@ import time
 from contextlib import suppress
 from pathlib import Path
 
+if __package__:
+    from .plait_engine_cgroup import create_cgroup, verified_cgroup, write_control
+else:
+    from plait_engine_cgroup import create_cgroup, verified_cgroup, write_control
+
 ENGINE_STOP_GRACE_SECONDS = 10
 EXEC_REJECTIONS = (errno.ENOENT, errno.ENOTDIR, errno.EACCES, errno.ENOEXEC)
 
@@ -81,9 +86,22 @@ def run(descriptor: Path, record: dict, binding: dict, command: list[str]) -> No
     children.read_text(encoding="utf-8")
 
     owner = descriptor.with_suffix(".owner.json")
-    write_json(owner, record)
-    write_json(descriptor, binding)
     receipt = {name: record[name] for name in ("host", "version", "grants", "origin")}
+    cgroup_root = record.pop("cgroup_root", None)
+    try:
+        if cgroup_root is not None:
+            record["cgroup"] = create_cgroup(cgroup_root, record["origin"])
+            write_json(owner, record)
+            with verified_cgroup(record) as fd:
+                write_control(fd, "cgroup.procs", "0")
+        else:
+            write_json(owner, record)
+    except (OSError, ValueError) as error:
+        # Enrollment and journaling both precede the only engine spawn.
+        receipt["error"] = str(error)
+        write_json(descriptor.with_suffix(".failed.json"), receipt)
+        return
+    write_json(descriptor, binding)
     try:
         engine = subprocess.Popen(command, start_new_session=True)
     except OSError as error:
