@@ -108,6 +108,19 @@ def recipe_binding_id(base_id: str, width: int, egress_bytes: int | None) -> str
     return digest.hexdigest()[:32]
 
 
+def tensor_pipeline_binding_id(
+    base_id: str, tensor_parallel: int, pipeline_parallel: int, egress_bytes: int | None
+) -> str:
+    digest = sha256(b"plait-tensor-pipeline-recipe-v1")
+    digest.update(parse_id(base_id))
+    digest.update(tensor_parallel.to_bytes(8, "little"))
+    digest.update(pipeline_parallel.to_bytes(8, "little"))
+    digest.update(bytes([egress_bytes is not None]))
+    if egress_bytes is not None:
+        digest.update(egress_bytes.to_bytes(8, "little"))
+    return digest.hexdigest()[:32]
+
+
 @dataclass
 class Deployment:
     group_id: str
@@ -215,8 +228,7 @@ class Deployment:
                 raise ValueError(
                     "layout recipe needs one positive KV budget per PP stage"
                 )
-        if len(self.recipe_bindings()) != len(self.layout_recipes or {}):
-            raise ValueError("duplicate committed Plait recipe binding")
+        self.recipe_bindings()
         for host, address in self.hosts.items():
             parse_id(host)
             ip = ipaddress.ip_address(address)
@@ -232,12 +244,19 @@ class Deployment:
             raise ValueError("configure disjoint API and rendezvous port ranges")
 
     def recipe_bindings(self) -> dict[str, dict]:
-        return {
-            recipe_binding_id(
-                key, recipe["width"], recipe.get("replicated_egress_bytes")
-            ): recipe
-            for key, recipe in (self.layout_recipes or {}).items()
-        }
+        bindings = {}
+        for base_id, recipe in (self.layout_recipes or {}).items():
+            cap = recipe.get("replicated_egress_bytes")
+            keys = [recipe_binding_id(base_id, recipe["width"], cap)]
+            tp = recipe.get("tensor_parallel", 1)
+            pp = len(recipe.get("pipeline_layers", ()))
+            if tp > 1 and pp > 1:
+                keys.append(tensor_pipeline_binding_id(base_id, tp, pp, cap))
+            for key in keys:
+                if key in bindings:
+                    raise ValueError("duplicate committed Plait recipe binding")
+                bindings[key] = recipe
+        return bindings
 
     def place(self, view: dict) -> "Placement":
         version = view["version"]

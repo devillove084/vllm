@@ -29,6 +29,7 @@ from vllm.entrypoints.serve.plait_deploy import (
     EngineGrantReturn,
     RoutePublisher,
     WorkerProcess,
+    recipe_binding_id,
     reconcile_orphan_cgroup,
     reconcile_owner,
 )
@@ -198,6 +199,47 @@ class TestPlaitDeployment(unittest.TestCase):
             assert model.take_axis("tp", [2, 3], device)[1] == (library, tp)
             assert model.take_axis("pp", [1, 3], device)[1] == (library, pp)
             join.assert_called_once_with(device, model.binding, 3, 2)
+
+    def test_mixed_recipe_binding_rejects_the_wrong_geometry_at_the_same_width(self):
+        base_id = "05" * 16
+        grants = [
+            {"device": {"node": [host] * 16, "ordinal": slot}}
+            for host in (1, 2)
+            for slot in range(3)
+        ]
+        for cap, binding in [
+            (None, "de552deaea089196c02a9a8007ec5181"),
+            (0, "77b221cb6d08d3ee7fc3895d20450457"),
+            (1024, "ec4150f8b6280f2c4ff75230fa239e79"),
+        ]:
+            with self.subTest(cap=cap):
+                recipe = {
+                    "width": 6,
+                    "tensor_parallel": 2,
+                    "pipeline_layers": [9, 9, 10],
+                    "replicated_egress_bytes": cap,
+                }
+                matching = replace(self.config, layout_recipes={base_id: recipe})
+                wrong = replace(
+                    self.config,
+                    layout_recipes={
+                        base_id: {
+                            **recipe,
+                            "tensor_parallel": 3,
+                            "pipeline_layers": [14, 14],
+                        }
+                    },
+                )
+                view = {
+                    **self.view,
+                    "grants": grants,
+                    "recipe": list(bytes.fromhex(binding)),
+                }
+                assert matching.place(view).parallel_sizes == (2, 3)
+                with self.assertRaisesRegex(ValueError, "missing launch definition"):
+                    wrong.place(view)
+                view["recipe"] = list(bytes.fromhex(recipe_binding_id(base_id, 6, cap)))
+                assert matching.place(view).parallel_sizes == (2, 3)
 
     def test_mixed_recipe_rejects_a_nonrectangular_width(self):
         with self.assertRaisesRegex(ValueError, "valid TP × PP width"):
