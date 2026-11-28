@@ -110,6 +110,7 @@ class Provision:
     devices: int
     rps: float
     valid_until_ms: int
+    bridge: str | None = None
 
     @classmethod
     def read(cls, profile: dict, parent: Path, model: str | None) -> "Provision":
@@ -118,7 +119,14 @@ class Provision:
         )
         if not members or len({member.group for member in members}) != len(members):
             raise ValueError("provision needs unique execution groups")
-        return cls(members, *profile_limits(profile, len(members)))
+        bridge = profile.get("bridge")
+        if bridge is not None and (
+            not isinstance(bridge, str)
+            or not VERSION.fullmatch(bridge)
+            or bridge.split("@", 1)[0] in {member.group for member in members}
+        ):
+            raise ValueError("a provision bridge needs a separate versioned group")
+        return cls(members, *profile_limits(profile, len(members)), bridge)
 
 
 def number(value: object, *, positive: bool = False) -> float:
@@ -156,12 +164,18 @@ class Policy:
             Provision.read(profile, path.parent, model)
             for profile in config.get("provision", [])
         )
+        bridges = [
+            frozenset([target.bridge]) for target in provision if target.bridge is not None
+        ]
+        mode_versions = {mode.versions for mode in modes}
         if (
             type(revision) is not int
             or revision < 1
             or type(stable) is not int
             or stable < 1
-            or len({mode.versions for mode in modes}) != len(modes)
+            or len(mode_versions) != len(modes)
+            or len(set(bridges)) != len(bridges)
+            or not mode_versions.issuperset(bridges)
         ):
             raise ValueError("invalid serving mode policy")
         return cls(
@@ -374,11 +388,19 @@ class ModeController:
             self.proposal = None
             self.windows = 0
             return
+        bridges = {
+            frozenset([target.bridge]): target
+            for target in policy.provision
+            if target.bridge is not None
+        }
+        if target := bridges.get(active):
+            self.advance_reuse(view, snapshot, policy, demand, incumbent, target, profiles)
+            return
         candidates = sorted(
             (
                 (gain(policy, incumbent, mode, demand), mode)
                 for mode in eligible
-                if mode != incumbent
+                if mode != incumbent and mode.versions not in bridges
             ),
             key=lambda item: (-item[0], item[1].devices, sorted(item[1].versions)),
         )
@@ -425,22 +447,21 @@ class ModeController:
         score, target = chosen
         if (
             not self.ready(incumbent, routes, active, verify_http=False)
-            or snapshot() != view
-            or Policy.read(self.path, self.model) != policy
-            or min(incumbent.valid_until_ms, target.valid_until_ms)
-            <= time.time_ns() // 1_000_000
+            or not self.current(view, snapshot, policy, incumbent, target)
         ):
             self.proposal = None
             self.windows = 0
             return
         if isinstance(target, Provision):
-            if not self.calibrate(view, target, policy.calibration) and self.prepare(
-                view, target
-            ):
-                print(
-                    f"Plait prepared a candidate layout at {demand:.2f} requests/s",
-                    flush=True,
-                )
+            if not self.calibrate(view, target, policy.calibration):
+                decision = self.prepare(view, target)
+                if decision == "prepare_set":
+                    print(
+                        f"Plait prepared a candidate layout at {demand:.2f} requests/s",
+                        flush=True,
+                    )
+                elif decision == "no_placement" and target.bridge is not None:
+                    self.begin_reuse(view, snapshot, policy, demand, incumbent, target, profiles)
         else:
             self.switch(view.groups, active, target.versions)
             if self.calibrator is not None:
@@ -453,6 +474,84 @@ class ModeController:
             )
         self.proposal = None
         self.windows = 0
+
+    def begin_reuse(
+        self,
+        view: ModeView,
+        snapshot: Callable[[], ModeView | None],
+        policy: Policy,
+        demand: float,
+        incumbent: Capacity,
+        target: Provision,
+        profiles: dict[frozenset[str], Capacity],
+    ) -> None:
+        assert target.bridge is not None
+        bridge = profiles.get(frozenset([target.bridge]))
+        if bridge is None or bridge.rps < demand:
+            return
+        request = self.plan_request(view, target)
+        request["after_releasing"] = [
+            {"group": list(bytes.fromhex(group)), "epoch": epoch}
+            for group, epoch in sorted(active_epochs(view.active).items())
+        ]
+        preview = self.control.request(request)
+        if (
+            preview["decision"] != "after_release"
+            or sum(len(plan["workers"]) for plan in preview["plans"]) != target.devices
+            or not self.ready(bridge, view.routes, view.active)
+            or not self.current(view, snapshot, policy, incumbent, target, bridge)
+        ):
+            return
+        self.switch(view.groups, view.active, bridge.versions)
+        self.cooldown_until = time.monotonic() + policy.cooldown_seconds
+        print("Plait activated a temporary layout for device reuse", flush=True)
+
+    def advance_reuse(
+        self,
+        view: ModeView,
+        snapshot: Callable[[], ModeView | None],
+        policy: Policy,
+        demand: float,
+        bridge: Capacity,
+        target: Provision,
+        profiles: dict[frozenset[str], Capacity],
+    ) -> None:
+        if not self.current(view, snapshot, policy, bridge, target):
+            return
+        groups = {member.group for member in target.members}
+        mode = next(
+            (
+                candidate
+                for candidate in profiles.values()
+                if candidate.devices == target.devices
+                and candidate.rps >= min(demand, bridge.rps)
+                and candidate.versions.isdisjoint(view.active)
+                and active_epochs(candidate.versions).keys() == groups
+                and self.ready(candidate, view.routes, view.active)
+            ),
+            None,
+        )
+        if mode is not None:
+            if self.current(view, snapshot, policy, bridge, target, mode):
+                self.switch(view.groups, view.active, mode.versions)
+                self.cooldown_until = time.monotonic() + policy.cooldown_seconds
+                print("Plait activated the layout prepared after device release", flush=True)
+        elif not self.calibrate(view, target, policy.calibration):
+            self.prepare(view, target)
+
+    def current(
+        self,
+        view: ModeView,
+        snapshot: Callable[[], ModeView | None],
+        policy: Policy,
+        *profiles: Capacity | Provision,
+    ) -> bool:
+        return (
+            snapshot() == view
+            and Policy.read(self.path, self.model) == policy
+            and min(profile.valid_until_ms for profile in profiles)
+            > time.time_ns() // 1_000_000
+        )
 
     def reap_failed_sets(self, policy: Policy) -> None:
         now = time.monotonic()
@@ -575,13 +674,14 @@ class ModeController:
             return False
         versions = frozenset(endpoint.version for path in routes for endpoint in path)
         layout = self.inspect_layout(versions, routes, view.active)
-        if layout is not None:
-            devices, manifest = layout
-            self.calibrator.start(
-                Target(view.revision, view.active, routes, devices, manifest),
-                settings,
-                self.model,
-            )
+        if layout is None:
+            return False
+        devices, manifest = layout
+        self.calibrator.start(
+            Target(view.revision, view.active, routes, devices, manifest),
+            settings,
+            self.model,
+        )
         return True
 
     def finish_calibration(
@@ -640,34 +740,40 @@ class ModeController:
             flush=True,
         )
 
-    def prepare(self, view: ModeView, target: Provision) -> bool:
+    def plan_request(self, view: ModeView, target: Provision) -> dict:
         incumbent = active_epochs(view.active)
         targets = [member.group for member in target.members]
         guarded = sorted(set(view.groups).union(targets))
-        request = {
+        return {
             "request": "plan_set",
-            "prepare": self.control.next_operation_id(),
             "guards": [
                 [list(bytes.fromhex(group)), incumbent.get(group)] for group in guarded
             ],
             "groups": [member.request() for member in target.members],
         }
+
+    def prepare(self, view: ModeView, target: Provision) -> str:
+        request = self.plan_request(view, target)
+        request["prepare"] = self.control.next_operation_id()
         try:
             response = self.control.request(request)
         except ControlError:
             response = self.control.request(request)
-        if response["decision"] in ("pending", "no_placement"):
-            return False
+        decision = response["decision"]
+        if decision in ("pending", "no_placement"):
+            return decision
         result = response["result"]
         if "Ok" not in result:
             raise ControlError(f"Plait layout preparation rejected: {result['Err']}")
         versions = result["Ok"]["PreparedSet"]
-        if [bytes(version["group"]).hex() for version in versions] != targets or any(
+        if [bytes(version["group"]).hex() for version in versions] != [
+            member.group for member in target.members
+        ] or any(
             type(version["epoch"]) is not int or version["epoch"] < 1
             for version in versions
         ):
             raise ControlError("Plait returned a different candidate set")
-        return True
+        return decision
 
     def ready(
         self,

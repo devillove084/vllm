@@ -17,6 +17,7 @@ check() {
 check PlaitServingIngress PlaitServingIngress
 check PlaitNativeServingIngress PlaitServingIngress
 check PlaitNativeBridgeHandoff PlaitNativeBridgeHandoff
+check PlaitAutomaticDeviceReuse PlaitAutomaticDeviceReuse
 check PlaitCompletionReplay PlaitCompletionReplay
 check PlaitCompletionKvResume PlaitCompletionReplay
 check PlaitCompletionPrefixResume PlaitCompletionPrefixResume

@@ -796,6 +796,8 @@ class ModePolicyTest(unittest.TestCase):
         self.preparations = {}
         self.aborts = []
         self.tickets = {}
+        self.device_counts = {}
+        self.preview_reply = {"decision": "no_placement"}
         self.plan_reply = {"decision": "pending"}
         self.may_lose_reply = False
         self.control = Mock()
@@ -831,6 +833,8 @@ class ModePolicyTest(unittest.TestCase):
             if self.may_lose_reply:
                 self.may_lose_reply = False
                 raise mode.ControlError("reply lost")
+            if "after_releasing" in request:
+                return self.preview_reply
             return self.plan_reply
         if request["request"] == "view":
             version = request["version"]
@@ -844,7 +848,7 @@ class ModePolicyTest(unittest.TestCase):
                 "group": {
                     "phase": phase,
                     "version": version,
-                    "grants": [{}],
+                    "grants": [{}] * self.device_counts.get(epoch, 1),
                     "manifest": {"ticket": self.tickets.get(epoch, epoch)},
                 }
             }
@@ -1018,6 +1022,90 @@ class ModePolicyTest(unittest.TestCase):
         self.sample(12)
         self.sample(12)
         self.assertEqual(self.plans, [])
+        self.assertEqual(self.requests, [])
+
+    def configure_device_reuse(self):
+        primary, bridge, target = (self.versions[i] for i in (0, 3, 4))
+        target_group = self.groups[0]
+        deployment = self.policy.with_name("primary.json")
+        deployment.write_text(
+            json.dumps(native_deployment(target_group, target_group, 8100))
+        )
+        self.routes = (self.routes[0], self.routes[2])
+        self.ready = {bridge}
+        self.config["modes"] = [
+            self.profile([primary], 1, 4),
+            self.profile([bridge], 1, 15),
+            self.profile([target], 4, 12),
+        ]
+        self.config["provision"] = [
+            {
+                "groups": [
+                    {"deployment": deployment.name, "workload": {"widths": [4]}}
+                ],
+                "devices": 4,
+                "bridge": bridge,
+                "slo_profile": {"rps": 12, "valid_until_ms": 60_000},
+            }
+        ]
+        self.policy.write_text(json.dumps(self.config))
+        self.plan_reply = {"decision": "no_placement"}
+        self.preview_reply = {"decision": "after_release", "plans": [{"workers": [{}] * 4}]}
+        return bridge, target
+
+    def test_device_reuse_continues_from_the_active_bridge_after_restart(self):
+        bridge, target = self.configure_device_reuse()
+        self.sample(0, seconds=0)
+        self.sample(10)
+        self.sample(10)
+        self.assertEqual(len(self.plans), 2)
+        prepare, preview = self.plans
+        self.assertIn("prepare", prepare)
+        self.assertNotIn("prepare", preview)
+        self.assertEqual(
+            preview["after_releasing"],
+            [{"group": list(bytes.fromhex(self.groups[0])), "epoch": 1}],
+        )
+        self.assertEqual(
+            [(change["expected"], change["target"]) for change in self.changes()],
+            [(1, None), (None, None), (None, None), (None, 1)],
+        )
+
+        self.active = frozenset([bridge])
+        self.controller = mode.ModeController(self.policy, self.load, self.control)
+        self.sample(0, seconds=0)
+        self.sample(10)
+        resumed = self.plans[-1]
+        self.assertIn("prepare", resumed)
+        self.assertNotIn("after_releasing", resumed)
+        self.assertEqual(resumed["guards"][-1], [list(bytes.fromhex(self.groups[3])), 1])
+        self.assertEqual(len(self.requests), 1)
+
+        self.routes += ((Endpoint("127.0.0.1", 8005, target, "aggregated"),),)
+        self.ready = {target}
+        self.device_counts[target] = 4
+        self.health.return_value = False
+        self.sample(10)
+        self.assertEqual(len(self.requests), 1)
+        self.health.return_value = True
+        self.sample(10)
+        self.assertEqual(
+            [(change["expected"], change["target"]) for change in self.changes()],
+            [(None, 2), (None, None), (None, None), (1, None)],
+        )
+
+    def test_device_reuse_needs_a_feasible_preview_and_a_bridge_that_can_carry_load(self):
+        self.configure_device_reuse()
+        self.preview_reply = {"decision": "no_placement"}
+        self.sample(0, seconds=0)
+        self.sample(10)
+        self.sample(10)
+        self.assertEqual(len(self.plans), 2)
+        self.assertEqual(self.requests, [])
+        self.preview_reply = {"decision": "after_release", "plans": [{"workers": [{}] * 4}]}
+        self.sample(16)
+        self.sample(16)
+        self.assertNotIn("after_releasing", self.plans[-1])
         self.assertEqual(self.requests, [])
 
     def configure_calibration(self):
