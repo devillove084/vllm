@@ -622,10 +622,12 @@ class ModeController:
         settings = (
             asdict(policy.calibration) if policy.calibration is not None else None
         )
-        if settings is not None and not legacy:
+        if settings is not None:
             # A completed trial measures the timed workload of an exact live
-            # layout. Warmup count controls how subsequent trials prepare it.
-            del settings["warmups"]
+            # layout. Warmup settings control how subsequent trials prepare it.
+            del settings["warmup_decode_widths"]
+            if not legacy:
+                del settings["warmups"]
         return fingerprint(
             {
                 "model": self.model,

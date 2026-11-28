@@ -2,9 +2,11 @@
 EXTENDS Naturals
 
 CONSTANTS CheckProfile, CheckVersion, CheckLifetime, CheckCapacity,
-          KeepWarmupProfiles, CancelWarmupRun
+          KeepWarmupProfiles, CancelWarmupRun, CheckFirstTokens, CheckTimedEvidence
 Candidates == 1..2
-NoRun == [candidate |-> 0, epoch |-> 0]
+Streams == 1..2
+WarmupPhases == {"Warmup", "Injected"}
+NoRun == [candidate |-> 0, epoch |-> 0, phase |-> "Idle", first |-> {}]
 NoProfile == [epoch |-> 0, fresh |-> FALSE, covers |-> FALSE]
 
 VARIABLES active, versions, run, profiles, evidence, warmups
@@ -25,13 +27,31 @@ ChangeEpoch(candidate) ==
     /\ versions' = [versions EXCEPT ![candidate] = 2]
     /\ UNCHANGED <<active, run, profiles, evidence, warmups>>
 
-StartBenchmark ==
+StartBenchmark(withWarmup) ==
     /\ active < 2 /\ run = NoRun
-    /\ run' = [candidate |-> active + 1, epoch |-> versions[active + 1]]
+    /\ run' = [candidate |-> active + 1, epoch |-> versions[active + 1],
+               phase |-> IF withWarmup THEN "Warmup" ELSE "Timed", first |-> {}]
+    /\ UNCHANGED <<active, versions, profiles, evidence, warmups>>
+
+FirstToken(stream) ==
+    /\ run.phase = "Warmup" /\ stream \notin run.first
+    /\ run' = [run EXCEPT !.first = @ \cup {stream}]
+    /\ UNCHANGED <<active, versions, profiles, evidence, warmups>>
+
+InjectWarmup ==
+    /\ run.phase = "Warmup"
+    /\ (~CheckFirstTokens \/ run.first = Streams)
+    /\ run' = [run EXCEPT !.phase = "Injected"]
+    /\ UNCHANGED <<active, versions, profiles, evidence, warmups>>
+
+FinishWarmup ==
+    /\ run.phase = "Injected"
+    /\ run' = [run EXCEPT !.phase = "Timed"]
     /\ UNCHANGED <<active, versions, profiles, evidence, warmups>>
 
 FinishBenchmark(sufficient) ==
     /\ run # NoRun
+    /\ (~CheckTimedEvidence \/ run.phase = "Timed")
     /\ profiles' = [profiles EXCEPT ![run.candidate] =
                     [epoch |-> run.epoch, fresh |-> TRUE, covers |-> sufficient]]
     /\ run' = NoRun
@@ -69,7 +89,9 @@ Switch ==
     /\ UNCHANGED <<versions, run, profiles, warmups>>
 
 Next ==
-    \/ StartBenchmark \/ Switch \/ TuneWarmups
+    \/ \E withWarmup \in BOOLEAN : StartBenchmark(withWarmup)
+    \/ \E stream \in Streams : FirstToken(stream)
+    \/ InjectWarmup \/ FinishWarmup \/ Switch \/ TuneWarmups
     \/ \E candidate \in Candidates : ChangeEpoch(candidate) \/ Expire(candidate)
     \/ \E sufficient \in BOOLEAN : FinishBenchmark(sufficient)
 
@@ -80,4 +102,9 @@ NeedsFreshProfile == evidence.fresh
 CoversArrivalRate == evidence.covers
 WarmupPreservesCompletedProfiles == [][warmups' # warmups => profiles' = profiles]_vars
 WarmupCancelsPendingBenchmark == [][warmups' # warmups => run' = NoRun]_vars
+FirstTokensBeforeInjection == [][run.phase = "Warmup" /\ run'.phase = "Injected" =>
+                                 run.first = Streams]_vars
+WarmupCannotPublishProfile ==
+    [][run.phase \in WarmupPhases /\ run'.phase \notin WarmupPhases =>
+       profiles' = profiles]_vars
 ====

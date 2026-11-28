@@ -175,6 +175,13 @@ def main() -> None:
     parser.add_argument("--seeds", type=int, nargs="+", required=True)
     parser.add_argument("--prompts", type=int, default=64)
     parser.add_argument("--warmups", type=int, default=3)
+    parser.add_argument(
+        "--warmup-decode-widths",
+        type=int,
+        nargs="+",
+        default=[],
+        help="after the serial warmups, inject a prompt into each decoding wave",
+    )
     parser.add_argument("--ttft-ms", type=float, required=True)
     parser.add_argument("--tpot-ms", type=float, required=True)
     parser.add_argument("--attainment", type=float, default=0.95)
@@ -208,15 +215,24 @@ def main() -> None:
         parser.error("TTFT and TPOT targets must be finite and positive")
     if not 0 < args.attainment <= 1 or args.valid_for < 1:
         parser.error("attainment and profile lifetime must be positive")
+    if any(width < 1 for width in args.warmup_decode_widths):
+        parser.error("warmup decode widths must be positive")
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(
         prefix="plait-bench-", dir=args.output.parent
     ) as work:
         directory = Path(work)
+        warmup = None
+        timed = args
+        if args.warmup_decode_widths:
+            from .warmup import run_warmup
+
+            warmup = run_warmup(args)
+            timed = argparse.Namespace(**(vars(args) | {"warmups": 0}))
         points = []
         for rate in sorted(args.rates):
-            trials = [run_trial(args, rate, seed, directory) for seed in args.seeds]
+            trials = [run_trial(timed, rate, seed, directory) for seed in args.seeds]
             points.append({"offered_rps": rate, "trials": trials})
             if args.stop_at_first_miss and not meets_attainment(
                 trials, args.attainment
@@ -231,6 +247,7 @@ def main() -> None:
                 "output_tokens": args.output_tokens,
                 "prompts": args.prompts,
                 "warmups": args.warmups,
+                "warmup_decode_widths": args.warmup_decode_widths,
                 "ttft_ms": args.ttft_ms,
                 "tpot_ms": args.tpot_ms,
                 "attainment": args.attainment,
@@ -238,6 +255,8 @@ def main() -> None:
             "points": points,
             **summarize(points, args.attainment, args.valid_for * 1000),
         }
+        if warmup is not None:
+            result["warmup"] = warmup
         pending = directory / "profile.json"
         pending.write_text(json.dumps(result, indent=2, allow_nan=False) + "\n")
         pending.replace(args.output)

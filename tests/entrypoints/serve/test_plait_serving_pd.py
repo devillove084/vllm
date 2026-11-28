@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Huanbing
 """Regression tests for versioned serving, drain, and route replacement."""
 
+import asyncio
 import contextlib
 import http.client
 import json
@@ -12,6 +13,7 @@ import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from itertools import product
 from pathlib import Path
@@ -23,6 +25,7 @@ from vllm.entrypoints.serve.plait_serving import (
     benchmark,
     disaggregate,
     mode,
+    warmup,
 )
 from vllm.entrypoints.serve.plait_serving import group as group_tools
 from vllm.entrypoints.serve.plait_serving.calibration import (
@@ -54,7 +57,7 @@ from vllm.entrypoints.serve.plait_serving.launch import (
     resident_spec,
 )
 from vllm.entrypoints.serve.plait_serving.load import Load
-from vllm.entrypoints.serve.plait_serving.mode_state import ProfileStore
+from vllm.entrypoints.serve.plait_serving.mode_state import ProfileStore, fingerprint
 from vllm.entrypoints.serve.plait_serving.replay import (
     RECOVERY_HEADER,
     RECOVERY_MODE,
@@ -523,6 +526,93 @@ class CalibrationTest(unittest.TestCase):
             self.assertEqual(
                 [point["passes"] for point in report["points"]], [True, False]
             )
+
+    def test_wave_preparation_runs_once_outside_the_timed_trials(self):
+        settings = Settings(
+            "/model", 64, 8, (2, 4), (7, 23), 2000, 500,
+            warmup_decode_widths=(2, 2, 3, 4),
+        )
+        endpoint = Endpoint("127.0.0.1", 8000, "01" * 16 + "@1", "aggregated")
+        target = Target(1, frozenset(), ((endpoint,),), 3)
+        phases = []
+        prepared = {"requests": 18, "seed": 0, "elapsed_s": 20}
+
+        def prepare(args):
+            self.assertEqual(args.warmup_decode_widths, [2, 2, 3, 4])
+            phases.append("warmup")
+            return prepared
+
+        def trial(args, rate, seed, directory):
+            self.assertEqual(args.warmups, 0)
+            phases.append((rate, seed))
+            return {
+                "arrivals": 16,
+                "good_requests": 16,
+                "finished_at_ms": 1000,
+                "kv_bytes": None,
+                "benchmark": {"request_goodput": rate},
+            }
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "capacity.json"
+            command = settings.command("http://127.0.0.1:7000", "test", target, output)
+            with (
+                patch("sys.argv", command[2:]),
+                patch.object(warmup, "run_warmup", side_effect=prepare),
+                patch.object(benchmark, "run_trial", side_effect=trial),
+            ):
+                benchmark.main()
+            self.assertEqual(phases, ["warmup", (2, 7), (2, 23), (4, 7), (4, 23)])
+            report = json.loads(output.read_text())
+            self.assertEqual(report["warmup"], prepared)
+            self.assertEqual(report["selected_rate"], 4)
+
+
+class WarmupWaveTest(unittest.IsolatedAsyncioTestCase):
+    async def test_inject_waits_for_both_first_tokens(self):
+        streams = asyncio.Queue()
+        complete = asyncio.Event()
+        inserted = asyncio.Event()
+
+        async def submit(callback):
+            if callback is None:
+                inserted.set()
+            else:
+                streams.put_nowait(callback)
+                await complete.wait()
+
+        run = asyncio.create_task(warmup.run_waves([2], 0, submit))
+        try:
+            first = await asyncio.wait_for(streams.get(), 1)
+            second = await asyncio.wait_for(streams.get(), 1)
+            first()
+            await asyncio.sleep(0)
+            self.assertFalse(inserted.is_set())
+            second()
+            await asyncio.wait_for(inserted.wait(), 1)
+            complete.set()
+            await asyncio.wait_for(run, 1)
+        finally:
+            run.cancel()
+            await asyncio.gather(run, return_exceptions=True)
+
+    async def test_failed_stream_cancels_the_rest_of_the_wave(self):
+        started = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def submit(callback):
+            self.assertIsNotNone(callback)
+            if started.is_set():
+                raise RuntimeError("stream failed before its first token")
+            started.set()
+            try:
+                await asyncio.Future()
+            finally:
+                cancelled.set()
+
+        with self.assertRaisesRegex(RuntimeError, "stream failed"):
+            await asyncio.wait_for(warmup.run_waves([2], 0, submit), 1)
+        self.assertTrue(cancelled.is_set())
 
 
 def native_deployment(group: str, host: str, port: int) -> dict:
@@ -1224,9 +1314,19 @@ class ModePolicyTest(unittest.TestCase):
         [profile] = store.read()
         self.assertEqual(profile["manifest"], target.manifest)
         policy = mode.Policy.read(self.policy, "test")
+        assert policy.calibration is not None
+        old_settings = asdict(policy.calibration)
+        del old_settings["warmup_decode_widths"]
+        measured_settings = old_settings.copy()
+        del measured_settings["warmups"]
+        old_context = {"model": "test", "revision": policy.route_revision}
+        self.assertEqual(
+            profile["context"],
+            fingerprint({**old_context, "settings": measured_settings}),
+        )
         legacy_profile = {
             **profile,
-            "context": self.controller.state_context(policy, legacy=True),
+            "context": fingerprint({**old_context, "settings": old_settings}),
         }
         store.path.write_text(json.dumps({"format": 1, "profiles": [legacy_profile]}))
         self.active = target.versions
@@ -1242,6 +1342,7 @@ class ModePolicyTest(unittest.TestCase):
 
         pending = self.controller.calibrator = Mock(run=None)
         self.config["calibration"]["warmups"] = 8
+        self.config["calibration"]["warmup_decode_widths"] = [2, 2, 3, 4]
         self.policy.write_text(json.dumps(self.config))
         self.sample(0, seconds=0)
         pending.cancel.assert_called_once()

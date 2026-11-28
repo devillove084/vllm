@@ -9,7 +9,7 @@ import os
 import sys
 import time
 import traceback
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
@@ -162,6 +162,8 @@ async def async_request_openai_completions(
     request_func_input: RequestFuncInput,
     session: aiohttp.ClientSession,
     pbar: tqdm | None = None,
+    *,
+    on_first_token: Callable[[], None] | None = None,
 ) -> RequestFuncOutput:
     """The async request function for the OpenAI Completions API.
 
@@ -169,6 +171,8 @@ async def async_request_openai_completions(
         request_func_input: The input for the request function.
         session: The aiohttp session used to issue the request.
         pbar: The progress bar to display the progress.
+        on_first_token: Run once after the first chunk with returned token IDs.
+            The request must set return_token_ids.
 
     Returns:
         The output of the request function.
@@ -230,6 +234,11 @@ async def async_request_openai_completions(
                             # usage summary response without a token so we
                             # want to check a token was generated
                             if choices := data.get("choices"):
+                                if on_first_token is not None and choices[0].get(
+                                    "token_ids"
+                                ):
+                                    on_first_token()
+                                    on_first_token = None
                                 # Note that text could be empty here
                                 # e.g. for special tokens
                                 text = choices[0].get("text")

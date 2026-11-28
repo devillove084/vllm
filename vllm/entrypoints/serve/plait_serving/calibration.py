@@ -34,11 +34,17 @@ class Settings:
     valid_for: int = 1800
     timeout_seconds: float = 600
     retry_seconds: float = 30
+    warmup_decode_widths: tuple[int, ...] = ()
 
     @classmethod
     def read(cls, raw: dict) -> "Settings":
         settings = cls(
-            **{**raw, "rates": tuple(raw["rates"]), "seeds": tuple(raw["seeds"])}
+            **{
+                **raw,
+                "rates": tuple(raw["rates"]),
+                "seeds": tuple(raw["seeds"]),
+                "warmup_decode_widths": tuple(raw.get("warmup_decode_widths", ())),
+            }
         )
         if (
             any(
@@ -59,6 +65,10 @@ class Settings:
             or not settings.seeds
             or any(type(seed) is not int or seed < 0 for seed in settings.seeds)
             or len(set(settings.seeds)) != len(settings.seeds)
+            or any(
+                type(width) is not int or width < 1
+                for width in settings.warmup_decode_widths
+            )
             or any(
                 type(value) not in (float, int)
                 or not math.isfinite(value)
@@ -104,6 +114,10 @@ class Settings:
         ]
         for flag, value in options.items():
             command.extend([f"--{flag}", str(value)])
+        if self.warmup_decode_widths:
+            command.extend(
+                ["--warmup-decode-widths", *map(str, self.warmup_decode_widths)]
+            )
         return [
             *command,
             "--stop-at-first-miss",

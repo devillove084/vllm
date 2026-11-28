@@ -196,6 +196,23 @@ def _make_input(api_url: str, n_tokens: int, endpoint_id: str) -> RequestFuncInp
     )
 
 
+@pytest.mark.parametrize("token_ids", [[], [42]])
+def test_completions_warmup_callback_requires_token_ids(token_ids):
+    received = []
+    request = _make_input("http://test/v1/completions", 2, "completions")
+    request.extra_body = {"return_token_ids": True}
+    chunk = _sse({"choices": [{"text": "", "token_ids": token_ids}]})
+    chunks = [(0, chunk), (0, chunk), (0, _usage_chunk(2)), (0, b"data: [DONE]\n\n")]
+    output = asyncio.run(
+        async_request_openai_completions(
+            request, _FakeSession(chunks), on_first_token=lambda: received.append(True)
+        )
+    )
+    assert output.success
+    assert output.output_tokens == 2
+    assert received == ([True] if token_ids else [])
+
+
 def _run(
     request_func,
     api_url: str,
