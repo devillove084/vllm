@@ -164,6 +164,7 @@ class Policy:
             Provision.read(profile, path.parent, model)
             for profile in config.get("provision", [])
         )
+        calibration = Settings.read(config["calibration"]) if "calibration" in config else None
         bridges = [
             frozenset([target.bridge]) for target in provision if target.bridge is not None
         ]
@@ -175,7 +176,7 @@ class Policy:
             or stable < 1
             or len(mode_versions) != len(modes)
             or len(set(bridges)) != len(bridges)
-            or not mode_versions.issuperset(bridges)
+            or (calibration is None and not mode_versions.issuperset(bridges))
         ):
             raise ValueError("invalid serving mode policy")
         return cls(
@@ -189,7 +190,7 @@ class Policy:
             number(config["minimum_gain_requests"]),
             modes,
             provision,
-            Settings.read(config["calibration"]) if "calibration" in config else None,
+            calibration,
         )
 
 
@@ -453,7 +454,7 @@ class ModeController:
             self.windows = 0
             return
         if isinstance(target, Provision):
-            if not self.calibrate(view, target, policy.calibration):
+            if not self.calibrate(view, view.projection_routes(target), policy.calibration):
                 decision = self.prepare(view, target)
                 if decision == "prepare_set":
                     print(
@@ -487,7 +488,7 @@ class ModeController:
     ) -> None:
         assert target.bridge is not None
         bridge = profiles.get(frozenset([target.bridge]))
-        if bridge is None or bridge.rps < demand:
+        if bridge is not None and bridge.rps < demand:
             return
         request = self.plan_request(view, target)
         request["after_releasing"] = [
@@ -498,8 +499,19 @@ class ModeController:
         if (
             preview["decision"] != "after_release"
             or sum(len(plan["workers"]) for plan in preview["plans"]) != target.devices
-            or not self.ready(bridge, view.routes, view.active)
-            or not self.current(view, snapshot, policy, incumbent, target, bridge)
+            or not self.current(view, snapshot, policy, incumbent, target)
+        ):
+            return
+        if bridge is None:
+            bridge_routes = tuple(
+                path
+                for path in view.routes
+                if len(path) == 1 and path[0].version == target.bridge
+            )
+            self.calibrate(view, bridge_routes, policy.calibration)
+            return
+        if not self.ready(bridge, view.routes, view.active) or not self.current(
+            view, snapshot, policy, incumbent, target, bridge
         ):
             return
         self.switch(view.groups, view.active, bridge.versions)
@@ -536,7 +548,7 @@ class ModeController:
                 self.switch(view.groups, view.active, mode.versions)
                 self.cooldown_until = time.monotonic() + policy.cooldown_seconds
                 print("Plait activated the layout prepared after device release", flush=True)
-        elif not self.calibrate(view, target, policy.calibration):
+        elif not self.calibrate(view, view.projection_routes(target), policy.calibration):
             self.prepare(view, target)
 
     def current(
@@ -665,11 +677,13 @@ class ModeController:
         self.restore_pending = waiting
 
     def calibrate(
-        self, view: ModeView, projection: Provision, settings: Settings | None
+        self,
+        view: ModeView,
+        routes: tuple[tuple[Endpoint, ...], ...],
+        settings: Settings | None,
     ) -> bool:
         if settings is None or self.calibrator is None or self.model is None:
             return False
-        routes = view.projection_routes(projection)
         if not routes:
             return False
         versions = frozenset(endpoint.version for path in routes for endpoint in path)

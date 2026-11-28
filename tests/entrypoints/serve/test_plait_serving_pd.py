@@ -1108,6 +1108,56 @@ class ModePolicyTest(unittest.TestCase):
         self.assertNotIn("after_releasing", self.plans[-1])
         self.assertEqual(self.requests, [])
 
+    def test_calibrates_bridge_before_switch_and_calibrates_target_after_release(self):
+        bridge, target = self.configure_device_reuse()
+        self.config["modes"] = self.config["modes"][:1]
+        self.config["calibration"] = {
+            "model": "/model",
+            "input_tokens": 64,
+            "output_tokens": 8,
+            "rates": [10, 16],
+            "seeds": [1, 2],
+            "ttft_ms": 100,
+            "tpot_ms": 20,
+        }
+        self.policy.write_text(json.dumps(self.config))
+        self.controller.model = "test"
+        self.controller.profile_store = ProfileStore(self.policy.with_name("capacity.json"))
+        calibrator = self.controller.calibrator = Mock(run=None)
+        self.sample(0, seconds=0)
+        self.sample(10)
+        self.sample(10)
+        bridge_measurement = calibrator.start.call_args.args[0]
+        self.assertEqual(bridge_measurement.versions, {bridge})
+        self.assertEqual(self.requests, [])
+
+        calibrator.run = SimpleNamespace(target=bridge_measurement)
+        calibrator.poll.return_value = {"rps": 14, "valid_until_ms": 60_000}
+        self.sample(10)
+        calibrator.run = None
+        self.sample(10)
+        self.assertEqual(self.changes()[3]["target"], 1)
+
+        self.active = frozenset([bridge])
+        self.ready = {target}
+        self.device_counts[target] = 4
+        self.routes = (self.routes[1], (Endpoint("127.0.0.1", 8005, target, "aggregated"),))
+        self.sample(10, seconds=2)
+        target_measurement = calibrator.start.call_args.args[0]
+        self.assertEqual(target_measurement.versions, {target})
+        self.assertEqual(target_measurement.active, {bridge})
+        self.assertEqual(len(self.requests), 1)
+
+        calibrator.run = SimpleNamespace(target=target_measurement)
+        calibrator.poll.return_value = {"rps": 16, "valid_until_ms": 60_000}
+        self.sample(10)
+        self.assertEqual(self.changes()[0]["target"], 2)
+        self.assertIsNone(self.changes()[3]["target"])
+        self.assertEqual(
+            {tuple(record["versions"]) for record in self.controller.profile_store.read()},
+            {(bridge,), (target,)},
+        )
+
     def configure_calibration(self):
         self.configure_provision()
         self.config["calibration"] = {
