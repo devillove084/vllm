@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
+import fcntl
 import json
 import tempfile
 import unittest
@@ -21,6 +22,7 @@ from vllm.entrypoints.serve.plait_deploy import (
     ControlUnavailable,
     Deployment,
     Engine,
+    FailedEngineLaunch,
     RoutePublisher,
     WorkerProcess,
 )
@@ -53,6 +55,8 @@ class TestPlaitDeployment(unittest.TestCase):
                 ],
             }
         )
+        self.control = Mock(spec=Control)
+        self.control.observe.return_value = {"phase": "Preparing"}
 
     def test_uneven_hosts_agree_on_engine_slot_order(self):
         group = self.placement.descriptor(self.second, self.config.seeds)["tp_groups"][
@@ -75,7 +79,9 @@ class TestPlaitDeployment(unittest.TestCase):
             patch(f"{module}.psutil.net_if_addrs", return_value=addresses),
             patch(f"{module}.subprocess.Popen") as spawn,
         ):
-            engine.start(self.config, self.placement, self.second, Path(directory))
+            engine.start(
+                self.config, self.placement, self.second, Path(directory), self.control
+            )
             env = spawn.call_args.kwargs["env"]
             assert env["CUDA_VISIBLE_DEVICES"] == "1,5"
             assert env["GLOO_SOCKET_IFNAME"] == "data"
@@ -102,7 +108,9 @@ class TestPlaitDeployment(unittest.TestCase):
             ),
             patch("vllm.entrypoints.serve.plait_deploy.subprocess.Popen") as spawn,
         ):
-            engine.start(self.config, placement, self.first, Path(directory))
+            engine.start(
+                self.config, placement, self.first, Path(directory), self.control
+            )
             env = spawn.call_args.kwargs["env"]
             command = spawn.call_args.args[0]
             assert command[command.index("--tensor-parallel-size") + 1] == "1"
@@ -160,7 +168,9 @@ class TestPlaitDeployment(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "deployment.json"
             recipes = {**self.config.layout_recipes, new: tuned}
-            path.write_text(json.dumps({**vars(self.config), "layout_recipes": recipes}))
+            path.write_text(
+                json.dumps({**vars(self.config), "layout_recipes": recipes})
+            )
             updated = self.config.reload_hosts(path)
             old = updated.place(legacy_view).descriptor(self.first, updated.seeds)
             newer = updated.place(planned_view).descriptor(self.first, updated.seeds)
@@ -169,7 +179,9 @@ class TestPlaitDeployment(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "committed recipe"):
                 updated.place({**planned_view, "recipe": [4] * 16})
             recipes[new] = {**tuned, "replicated_egress_bytes": 0}
-            path.write_text(json.dumps({**vars(self.config), "layout_recipes": recipes}))
+            path.write_text(
+                json.dumps({**vars(self.config), "layout_recipes": recipes})
+            )
             with self.assertRaisesRegex(ValueError, "only add hosts or recipes"):
                 updated.reload_hosts(path)
             wrong = Deployment.read(path)
@@ -260,6 +272,75 @@ class TestPlaitDeployment(unittest.TestCase):
                 )
                 assert response.status_code == 200
                 assert response.headers["X-Plait-Group-Role"] == "prefill"
+
+    def test_missing_executable_keeps_claim_until_revoked_grant_is_released(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            engine = Engine(
+                [str(state / "missing")],
+                "/models/example",
+                "CUDA_VISIBLE_DEVICES",
+                [],
+                {},
+            )
+            lock_path = state / f"{self.placement.version_text}.lock"
+            launch = engine.start(
+                self.config, self.placement, self.first, state, self.control
+            )
+            assert isinstance(launch, FailedEngineLaunch)
+            grant = {"device": {"node": [1] * 16, "ordinal": 2}, "fence": 7}
+            worker = WorkerProcess(launch, self.placement, [grant], None)
+            phase = "Preparing"
+            operations = []
+
+            def request(name, **fields):
+                if name == "view":
+                    return {"group": {"phase": phase}}
+                assert name == "apply"
+                operations.append(fields["operation"])
+                if len(operations) in (1, 3):
+                    raise ControlUnavailable("reply lost")
+                return {"result": {"Ok": {}}}
+
+            self.control.request.side_effect = request
+            self.control.observe.side_effect = lambda version: {"phase": phase}
+            with lock_path.open("a") as probe:
+                with self.assertRaises(ControlUnavailable):
+                    worker.reconcile(self.control)
+                assert not worker.reconcile(self.control)
+                assert operations[0] == operations[1]
+                assert operations[0]["action"] == {
+                    "ReportFailure": {"grant": grant, "fault": "Device"}
+                }
+                phase = "Revoked"
+                with self.assertRaises(ControlUnavailable):
+                    worker.reconcile(self.control)
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                assert worker.reconcile(self.control)
+                assert operations[-2] == operations[-1]
+                assert operations[-1]["action"] == {"Release": grant}
+                fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def test_engine_rechecks_phase_after_acquiring_launch_lock(self):
+        engine = Engine(["vllm"], "/models/example", "CUDA_VISIBLE_DEVICES", [], {})
+        self.control.observe.return_value = {"phase": "Revoked"}
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch("vllm.entrypoints.serve.plait_deploy.subprocess.Popen") as spawn,
+        ):
+            assert (
+                engine.start(
+                    self.config,
+                    self.placement,
+                    self.second,
+                    Path(directory),
+                    self.control,
+                )
+                is None
+            )
+            spawn.assert_not_called()
+            assert not list(Path(directory).glob("*.json"))
 
     def test_worker_releases_only_after_process_group_exit(self):
         with tempfile.TemporaryDirectory() as directory:

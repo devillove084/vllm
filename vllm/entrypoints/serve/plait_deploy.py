@@ -4,6 +4,7 @@
 
 import argparse
 import ctypes
+import errno
 import fcntl
 import ipaddress
 import json
@@ -21,7 +22,7 @@ from hashlib import sha256
 from http.client import HTTPConnection, HTTPException
 from pathlib import Path
 from socket import AF_INET
-from typing import Any
+from typing import IO, Any
 
 import psutil
 
@@ -122,7 +123,8 @@ class Deployment:
         old_recipes = self.layout_recipes or {}
         new_recipes = updated.layout_recipes or {}
         if (
-            replace(updated, hosts=self.hosts, layout_recipes=self.layout_recipes) != self
+            replace(updated, hosts=self.hosts, layout_recipes=self.layout_recipes)
+            != self
             or not self.hosts.items() <= updated.hosts.items()
             or any(new_recipes.get(key) != value for key, value in old_recipes.items())
         ):
@@ -144,7 +146,9 @@ class Deployment:
                 raise ValueError(
                     "pipeline_layers needs one positive layer count per stage"
                 )
-        if self.layout_recipes is not None and not isinstance(self.layout_recipes, dict):
+        if self.layout_recipes is not None and not isinstance(
+            self.layout_recipes, dict
+        ):
             raise ValueError("layout_recipes must map IDs to recipe objects")
         for recipe_id, recipe in (self.layout_recipes or {}).items():
             parse_id(recipe_id)
@@ -276,6 +280,12 @@ class Placement:
 
 
 @dataclass
+class FailedEngineLaunch:
+    error: str
+    lock: IO[str]
+
+
+@dataclass
 class Engine:
     argv: list[str]
     model: str
@@ -330,8 +340,13 @@ class Engine:
             raise ValueError("engine arguments contain a deployment-owned flag")
 
     def start(
-        self, deployment: Deployment, placement: Placement, host: str, state: Path
-    ) -> subprocess.Popen[bytes]:
+        self,
+        deployment: Deployment,
+        placement: Placement,
+        host: str,
+        state: Path,
+        control: Control,
+    ) -> subprocess.Popen[bytes] | FailedEngineLaunch | None:
         descriptor = state / f"{placement.version_text}.json"
         nodes = list(placement.devices)
         counts = [len(placement.devices[node]) for node in nodes]
@@ -413,15 +428,33 @@ class Engine:
         # A surviving engine owns its launch lock across supervisor restarts.
         with descriptor.with_suffix(".lock").open("a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            view = control.observe(placement.version)
+            if view is None or view["phase"] != "Preparing":
+                return None
+            prior_launch = descriptor.exists()
             binding = placement.descriptor(
                 host, deployment.seeds, deployment.compute_calibration
             )
             if self.api_role != "aggregated":
                 binding["api_role"] = self.api_role
             descriptor.write_text(json.dumps(binding), encoding="utf-8")
-            return subprocess.Popen(
-                command, env=env, start_new_session=True, pass_fds=(lock.fileno(),)
-            )
+            try:
+                return subprocess.Popen(
+                    command, env=env, start_new_session=True, pass_fds=(lock.fileno(),)
+                )
+            except OSError as error:
+                # An earlier launch may have left descendants. Only a first
+                # attempt with a definite exec rejection proves no process ran.
+                if prior_launch or error.errno not in (
+                    errno.ENOENT,
+                    errno.ENOTDIR,
+                    errno.EACCES,
+                    errno.ENOEXEC,
+                ):
+                    raise
+                return FailedEngineLaunch(
+                    str(error), os.fdopen(os.dup(lock.fileno()), "a")
+                )
 
 
 def versioned_status(
@@ -507,7 +540,7 @@ class RoutePublisher:
 
 @dataclass
 class WorkerProcess:
-    process: subprocess.Popen[bytes]
+    process: subprocess.Popen[bytes] | FailedEngineLaunch
     placement: Placement
     grants: list[dict]
     drain_marker: Path | None
@@ -526,7 +559,7 @@ class WorkerProcess:
             raise ControlUnavailable(f"Plait group operation rejected: {result['Err']}")
 
     def gone(self) -> bool:
-        if self.group_exited:
+        if self.group_exited or isinstance(self.process, FailedEngineLaunch):
             return True
         if self.process.poll() is None:
             return False
@@ -550,7 +583,10 @@ class WorkerProcess:
             if phase in ("Draining", "Revoked", "Retired"):
                 view = control.observe(version)
                 phase = view["phase"] if view else None
-            if phase not in ("Revoked", "Retired") and self.process.poll() is not None:
+            if phase not in ("Revoked", "Retired") and (
+                isinstance(self.process, FailedEngineLaunch)
+                or self.process.poll() is not None
+            ):
                 self.apply(
                     control,
                     {"ReportFailure": {"grant": self.grants[0], "fault": "Device"}},
@@ -570,12 +606,16 @@ class WorkerProcess:
         while self.release_index < len(self.grants):
             self.apply(control, {"Release": self.grants[self.release_index]})
             self.release_index += 1
+        if isinstance(self.process, FailedEngineLaunch):
+            self.process.lock.close()
         print(
             f"Released local Plait grants for {self.placement.version_text}", flush=True
         )
         return True
 
     def signal(self, sig: signal.Signals) -> None:
+        if isinstance(self.process, FailedEngineLaunch):
+            return
         with suppress(ProcessLookupError):
             os.killpg(self.process.pid, sig)
 
@@ -659,15 +699,22 @@ def supervise(
                                         state / f"{placement.version_text}.drain"
                                     )
                                 process = engine.start(
-                                    deployment, placement, host, state
+                                    deployment, placement, host, state, control
                                 )
-                                children[epoch] = WorkerProcess(
-                                    process,
-                                    placement,
-                                    grants,
-                                    drain_marker,
-                                    api_role=engine.api_role,
-                                )
+                                if process is not None:
+                                    children[epoch] = WorkerProcess(
+                                        process,
+                                        placement,
+                                        grants,
+                                        drain_marker,
+                                        api_role=engine.api_role,
+                                    )
+                                    if isinstance(process, FailedEngineLaunch):
+                                        print(
+                                            f"Plait engine for epoch {epoch} "
+                                            f"failed to start: {process.error}",
+                                            flush=True,
+                                        )
                             if route and router is not None:
                                 router.reconcile(control, placement, phase)
                 last_error = None
@@ -682,6 +729,9 @@ def supervise(
             if not child.gone():
                 child.signal(signal.SIGTERM)
         for child in children.values():
+            if isinstance(child.process, FailedEngineLaunch):
+                child.process.lock.close()
+                continue
             try:
                 child.process.wait(timeout=10)
             except subprocess.TimeoutExpired:
